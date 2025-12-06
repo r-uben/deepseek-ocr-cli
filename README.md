@@ -146,14 +146,15 @@ Automatically applied to all OCR results:
 
 ## Performance
 
-Typical performance on Apple Silicon M3 Pro Max:
-- Simple pages: 3-8 seconds per page
-- Dense tables/charts: 15-50 seconds per page
-- Very complex pages: Up to 7 minutes (rare)
-- Average (mixed content): ~20 seconds per page
-- 24-page PDF: ~8-20 minutes
+Typical performance on Apple Silicon M3 Max with 200 DPI, JPEG encoding:
+- Simple receipt/form: ~10 seconds
+- Standard text pages: ~15-20 seconds per page
+- Dense tables/charts: ~30-40 seconds per page
+- Very complex pages: Up to 2 minutes (rare)
 
-Processing time varies significantly based on content density. Sparse pages process quickly, while dense tables or complex layouts take longer. The tool includes a 10-minute timeout per page to handle extreme cases.
+**Example:** 1-page receipt processed in 11 seconds (tested).
+
+Processing time varies based on content density. The tool uses 200 DPI and JPEG encoding for optimal speed while maintaining quality. Timeout is set to 30 minutes per page for extremely dense documents.
 
 ## Configuration
 
