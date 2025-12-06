@@ -1,20 +1,19 @@
 # DeepSeek OCR CLI
 
-[![PyPI version](https://badge.fury.io/py/deepseek-ocr-cli.svg)](https://badge.fury.io/py/deepseek-ocr-cli)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A command-line tool for OCR (Optical Character Recognition) using the DeepSeek-OCR model via Ollama. Runs locally with zero cloud dependencies.
+Command-line tool for OCR using DeepSeek-OCR via Ollama. Runs locally with no API keys or cloud dependencies.
 
 ## Features
 
-- **Local Processing**: No API keys, no usage costs, complete privacy
-- **Ollama Backend**: Simple setup, efficient inference
-- **Multiple Formats**: Process PDFs and images (JPG, PNG, WEBP, GIF, BMP, TIFF)
-- **Batch Processing**: Handle multiple files and directories
-- **Clean Markdown Output**: Tables converted to markdown, HTML stripped
-- **Progress Tracking**: Real-time progress bar for multi-page PDFs
-- **Rich CLI**: Beautiful terminal interface with progress bars and tables
+- Local processing with no API keys or usage costs
+- Powered by Ollama for efficient local inference
+- Supports PDFs and images (JPG, PNG, WEBP, GIF, BMP, TIFF)
+- Batch processing for multiple files and directories
+- Clean markdown output with HTML tables converted to markdown
+- Progress tracking for multi-page PDFs
+- Terminal interface with progress bars and summary tables
 
 ## Requirements
 
@@ -27,10 +26,10 @@ A command-line tool for OCR (Optical Character Recognition) using the DeepSeek-O
 ### 1. Install Ollama
 
 ```bash
-# macOS
+# macOS/Linux
 brew install ollama
 
-# Or download from https://ollama.ai/
+# Or download from https://ollama.ai
 ```
 
 ### 2. Pull the DeepSeek-OCR model
@@ -42,14 +41,14 @@ ollama pull deepseek-ocr
 ### 3. Install the CLI
 
 ```bash
-# Clone the repository
+pip install deepseek-ocr-cli
+```
+
+**Alternative: Install from source**
+
+```bash
 git clone https://github.com/r-uben/deepseek-ocr-cli.git
 cd deepseek-ocr-cli
-
-# Install with Poetry
-poetry install
-
-# Or with pip
 pip install -e .
 ```
 
@@ -136,24 +135,24 @@ backend: ollama
 [Extracted content from page 2...]
 ```
 
-### Output Cleaning
+### Output Processing
 
-The tool automatically:
-- Converts HTML tables to markdown tables
-- Removes bounding box annotations
-- Decodes HTML entities
-- Preserves LaTeX math expressions
+Automatically applied to all OCR results:
+- HTML tables converted to markdown tables
+- Bounding box annotations removed
+- HTML entities decoded
+- LaTeX math expressions preserved
 
 ## Performance
 
 Typical performance on Apple Silicon M3 Pro Max:
-- **Simple pages**: 3-8 seconds per page
-- **Dense tables/charts**: 15-50 seconds per page
-- **Very complex pages**: Up to 7 minutes (rare)
-- **Average (mixed content)**: ~20 seconds per page
-- **24-page PDF**: ~8-20 minutes
+- Simple pages: 3-8 seconds per page
+- Dense tables/charts: 15-50 seconds per page
+- Very complex pages: Up to 7 minutes (rare)
+- Average (mixed content): ~20 seconds per page
+- 24-page PDF: ~8-20 minutes
 
-**Note:** Processing time varies significantly based on content density. Sparse pages (cover pages, simple text) process quickly, while dense economic tables or complex layouts take longer. The tool includes a 10-minute timeout per page to handle extreme cases.
+Processing time varies significantly based on content density. Sparse pages process quickly, while dense tables or complex layouts take longer. The tool includes a 10-minute timeout per page to handle extreme cases.
 
 ## Configuration
 
@@ -174,24 +173,19 @@ OLLAMA_URL=http://localhost:11434
 from pathlib import Path
 from deepseek_ocr import ModelManager, OCRProcessor
 
-# Initialize and load model
 model_manager = ModelManager(model_name="deepseek-ocr")
 model_manager.load_model()
 
-# Create processor
 processor = OCRProcessor(
     model_manager=model_manager,
     output_dir=Path("./results"),
 )
 
-# Process a file
 result = processor.process_file(Path("document.pdf"))
 print(result.output_text)
 
-# Save result
 processor.save_result(result)
 
-# Cleanup
 model_manager.unload_model()
 ```
 
@@ -220,16 +214,10 @@ deepseek-ocr info
 ## Development
 
 ```bash
-# Install with dev dependencies
 poetry install
 
-# Run tests
 poetry run pytest
-
-# Format code
 poetry run black .
-
-# Lint
 poetry run ruff check .
 ```
 
@@ -237,7 +225,13 @@ poetry run ruff check .
 
 MIT License - see [LICENSE](LICENSE) for details.
 
-## Acknowledgments
+## Built With
 
-- [DeepSeek](https://github.com/deepseek-ai) for the OCR model
-- [Ollama](https://ollama.ai/) for local model serving
+This tool is built on top of:
+
+- [DeepSeek-OCR](https://github.com/deepseek-ai/DeepSeek-VL2) - Vision-language model for OCR by DeepSeek AI
+- [Ollama](https://ollama.ai/) - Local LLM runtime for running models efficiently
+- [PyMuPDF](https://github.com/pymupdf/PyMuPDF) - PDF processing library
+- [Pillow](https://python-pillow.org/) - Image processing library
+- [Click](https://click.palletsprojects.com/) - CLI framework
+- [Rich](https://rich.readthedocs.io/) - Terminal formatting and progress bars
