@@ -18,8 +18,7 @@ console = Console()
 
 
 def print_banner() -> None:
-    console.print("\n[bold cyan]DeepSeek OCR CLI[/bold cyan]", justify="center")
-    console.print(f"[dim]Version {__version__} (Ollama backend)[/dim]\n", justify="center")
+    console.print(f"[dim]deepseek-ocr v{__version__}[/dim]")
 
 
 @click.group()
@@ -117,10 +116,8 @@ def process(
     print_banner()
 
     try:
-        console.print("[yellow]Connecting to Ollama...[/yellow]")
         model_manager = ModelManager(model_name=model_name)
         model_manager.load_model()
-        console.print(f"[green]✓ Connected to Ollama ({model_name})[/green]")
 
         processor_kwargs = {
             "model_manager": model_manager,
@@ -132,12 +129,10 @@ def process(
 
         processor = OCRProcessor(**processor_kwargs)
 
-        console.print(f"[green]Processing:[/green] {input_path}")
-
         if input_path.is_file():
-            result = processor.process_file(input_path, prompt=prompt)
+            result = processor.process_file(input_path, prompt=prompt, show_progress=not ctx.obj["verbose"])
             output_path = processor.save_result(result)
-            console.print(f"[green]✓ Saved to:[/green] {output_path}")
+            console.print(f"→ {output_path}")
         else:
             results = processor.process_batch(
                 input_path,
@@ -146,9 +141,7 @@ def process(
                 show_progress=not ctx.obj["verbose"],
             )
 
-            console.print(f"\n[green]✓ Processed {len(results)} files[/green]")
-
-            table = Table(title="Processing Summary")
+            table = Table(show_header=True, header_style="bold")
             table.add_column("File", style="cyan")
             table.add_column("Pages", justify="right")
             table.add_column("Time (s)", justify="right")
@@ -163,10 +156,9 @@ def process(
             console.print(table)
 
         model_manager.unload_model()
-        console.print("\n[green]✓ Done![/green]\n")
 
     except Exception as e:
-        console.print(f"\n[red]✗ Error: {e}[/red]\n")
+        console.print(f"[red]error:[/red] {e}")
         sys.exit(1)
 
 

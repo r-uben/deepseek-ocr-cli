@@ -197,7 +197,7 @@ class ModelManager:
                     "images": [image_b64],
                     "stream": False,
                 },
-                timeout=600,  # 10 minute timeout for large/complex images
+                timeout=1800,  # 30 minute timeout for dense scanned documents (can be 50s/page)
             )
 
             if response.status_code != 200:
@@ -210,7 +210,7 @@ class ModelManager:
             return clean_ocr_output(raw_text)
 
         except requests.exceptions.Timeout:
-            raise RuntimeError("Ollama request timed out (>5 minutes)")
+            raise RuntimeError("Ollama request timed out (>30 minutes)")
         except requests.exceptions.ConnectionError:
             raise RuntimeError(
                 f"Lost connection to Ollama at {self.ollama_url}. "

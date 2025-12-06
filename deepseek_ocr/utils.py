@@ -12,8 +12,8 @@ PDF_EXTENSION = ".pdf"
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | {PDF_EXTENSION}
 
 
-def setup_logging(level: str = "INFO", verbose: bool = False) -> logging.Logger:
-    log_level = logging.DEBUG if verbose else getattr(logging, level.upper())
+def setup_logging(level: str = "WARNING", verbose: bool = False) -> logging.Logger:
+    log_level = logging.DEBUG if verbose else logging.WARNING
 
     logging.basicConfig(
         level=log_level,
