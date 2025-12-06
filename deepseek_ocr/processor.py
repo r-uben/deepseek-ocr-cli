@@ -78,7 +78,7 @@ class OCRProcessor:
         logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}")
 
     def _pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
-        """Convert PDF pages to images (300 DPI)."""
+        """Convert PDF pages to images (200 DPI)."""
         logger.debug(f"Converting PDF to images: {pdf_path}")
 
         try:
@@ -88,7 +88,7 @@ class OCRProcessor:
             for page_num in range(len(pdf_document)):
                 page = pdf_document[page_num]
 
-                zoom = 300 / 72
+                zoom = 200 / 72
                 mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat)
 

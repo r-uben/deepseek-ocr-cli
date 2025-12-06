@@ -157,7 +157,7 @@ class ModelManager:
         import io
 
         buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
+        image.save(buffer, format="JPEG", quality=95)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     def process_image(
@@ -187,8 +187,6 @@ class ModelManager:
         try:
             image_b64 = self._image_to_base64(image)
 
-            # NOTE: Adding optimization parameters (keep_alive, num_ctx, etc.) caused
-            # the model to hang indefinitely. Needs investigation of Ollama API compatibility.
             response = requests.post(
                 f"{self.ollama_url}/api/generate",
                 json={
@@ -196,8 +194,12 @@ class ModelManager:
                     "prompt": prompt,
                     "images": [image_b64],
                     "stream": False,
+                    "options": {
+                        "num_ctx": 8192,
+                        "temperature": 0.1,
+                    }
                 },
-                timeout=1800,  # 30 minute timeout for dense scanned documents (can be 50s/page)
+                timeout=1800,
             )
 
             if response.status_code != 200:
