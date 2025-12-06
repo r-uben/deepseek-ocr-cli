@@ -1,0 +1,78 @@
+[tool.poetry]
+name = "deepseek-ocr-cli"
+version = "0.2.0"
+description = "CLI tool for OCR using DeepSeek-OCR model via Ollama"
+authors = ["Ruben Fernandez Fuertes <fernandezfuertesruben@gmail.com>"]
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/r-uben/deepseek-ocr-cli"
+homepage = "https://github.com/r-uben/deepseek-ocr-cli"
+keywords = ["ocr", "deepseek", "cli", "pdf", "document-processing", "ollama"]
+packages = [{include = "deepseek_ocr"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: General",
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pillow = "^11.0.0"
+click = "^8.1.7"
+python-dotenv = "^1.0.0"
+tqdm = "^4.67.0"
+pydantic = "^2.10.0"
+pydantic-settings = "^2.7.0"
+pymupdf = "^1.25.1"
+rich = "^13.9.4"
+requests = "^2.31.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.4"
+pytest-cov = "^6.0.0"
+black = "^24.10.0"
+ruff = "^0.8.4"
+mypy = "^1.13.0"
+types-pillow = "^10.2.0"
+types-requests = "^2.31.0"
+
+[tool.poetry.scripts]
+deepseek-ocr = "deepseek_ocr.cli:main"
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--cov=deepseek_ocr --cov-report=term-missing --cov-report=html"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
