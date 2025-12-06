@@ -18,7 +18,6 @@ console = Console()
 
 
 def print_banner() -> None:
-    """Print CLI banner."""
     console.print("\n[bold cyan]DeepSeek OCR CLI[/bold cyan]", justify="center")
     console.print(f"[dim]Version {__version__} (Ollama backend)[/dim]\n", justify="center")
 
@@ -118,13 +117,11 @@ def process(
     print_banner()
 
     try:
-        # Initialize model manager
         console.print("[yellow]Connecting to Ollama...[/yellow]")
         model_manager = ModelManager(model_name=model_name)
         model_manager.load_model()
         console.print(f"[green]✓ Connected to Ollama ({model_name})[/green]")
 
-        # Initialize processor
         processor_kwargs = {
             "model_manager": model_manager,
             "extract_images": extract_images,
@@ -135,7 +132,6 @@ def process(
 
         processor = OCRProcessor(**processor_kwargs)
 
-        # Process files
         console.print(f"[green]Processing:[/green] {input_path}")
 
         if input_path.is_file():
@@ -150,10 +146,8 @@ def process(
                 show_progress=not ctx.obj["verbose"],
             )
 
-            # Print summary
             console.print(f"\n[green]✓ Processed {len(results)} files[/green]")
 
-            # Show results table
             table = Table(title="Processing Summary")
             table.add_column("File", style="cyan")
             table.add_column("Pages", justify="right")
@@ -168,7 +162,6 @@ def process(
 
             console.print(table)
 
-        # Cleanup
         model_manager.unload_model()
         console.print("\n[green]✓ Done![/green]\n")
 
@@ -182,7 +175,6 @@ def info() -> None:
     """Show system and configuration information."""
     print_banner()
 
-    # System info table
     sys_table = Table(title="System Information")
     sys_table.add_column("Component", style="cyan")
     sys_table.add_column("Status", style="green")
@@ -190,7 +182,6 @@ def info() -> None:
     sys_table.add_row("Python", f"{sys.version_info.major}.{sys.version_info.minor}")
     sys_table.add_row("Ollama URL", settings.ollama_url)
 
-    # Check Ollama status
     model_manager = ModelManager()
     ollama_running = model_manager._check_ollama_running()
     model_available = model_manager._check_model_available() if ollama_running else False
@@ -200,7 +191,6 @@ def info() -> None:
 
     console.print(sys_table)
 
-    # Settings table
     settings_table = Table(title="Current Settings")
     settings_table.add_column("Setting", style="cyan")
     settings_table.add_column("Value", style="yellow")
@@ -211,7 +201,6 @@ def info() -> None:
 
     console.print(settings_table)
 
-    # Supported formats
     console.print("\n[bold]Supported Formats:[/bold]")
     console.print("Images: JPG, PNG, WEBP, GIF, BMP, TIFF")
     console.print("Documents: PDF\n")
@@ -223,17 +212,12 @@ def info() -> None:
 
 
 def main() -> None:
-    """Entry point for CLI.
-
-    Supports a shorthand ``deepseek-ocr INPUT_PATH`` (like ``mistral-ocr``)
-    by rewriting arguments to the explicit ``process`` subcommand.
-    """
+    """Entry point. Supports shorthand `deepseek-ocr INPUT_PATH` by auto-inserting 'process' subcommand."""
     argv = sys.argv[1:]
 
     if argv:
         known_subcommands = {"process", "info"}
 
-        # Find first non-option argument (doesn't start with "-")
         first_non_option_index = None
         for idx, arg in enumerate(argv):
             if not arg.startswith("-"):
@@ -243,8 +227,6 @@ def main() -> None:
         if first_non_option_index is not None:
             candidate = argv[first_non_option_index]
 
-            # If it's not a known subcommand and looks like an existing path,
-            # treat it as INPUT_PATH and insert the "process" subcommand.
             if candidate not in known_subcommands and Path(candidate).exists():
                 argv = (
                     argv[:first_non_option_index]

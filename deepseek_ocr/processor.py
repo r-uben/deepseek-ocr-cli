@@ -33,15 +33,6 @@ class OCRResult:
         processing_time: float = 0.0,
         metadata: Optional[Dict] = None,
     ):
-        """Initialize OCR result.
-
-        Args:
-            input_path: Path to input file
-            output_text: Extracted text/markdown
-            page_count: Number of pages processed
-            processing_time: Processing time in seconds
-            metadata: Additional metadata
-        """
         self.input_path = input_path
         self.output_text = output_text
         self.page_count = page_count
@@ -50,14 +41,6 @@ class OCRResult:
         self.timestamp = datetime.now()
 
     def to_markdown(self, include_metadata: bool = True) -> str:
-        """Convert result to markdown format.
-
-        Args:
-            include_metadata: Include metadata header
-
-        Returns:
-            Markdown formatted string
-        """
         lines = []
 
         if include_metadata:
@@ -86,14 +69,6 @@ class OCRProcessor:
         extract_images: bool = False,
         include_metadata: bool = True,
     ):
-        """Initialize OCR processor.
-
-        Args:
-            model_manager: ModelManager instance (creates new if None)
-            output_dir: Output directory for results
-            extract_images: Extract and save images from PDFs
-            include_metadata: Include metadata in output
-        """
         self.model_manager = model_manager or ModelManager()
         self.output_dir = output_dir or settings.output_dir
         self.extract_images = extract_images or settings.extract_images
@@ -103,17 +78,7 @@ class OCRProcessor:
         logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}")
 
     def _pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
-        """Convert PDF pages to images.
-
-        Args:
-            pdf_path: Path to PDF file
-
-        Returns:
-            List of PIL Images (one per page)
-
-        Raises:
-            RuntimeError: If PDF conversion fails
-        """
+        """Convert PDF pages to images (300 DPI)."""
         logger.debug(f"Converting PDF to images: {pdf_path}")
 
         try:
@@ -123,12 +88,10 @@ class OCRProcessor:
             for page_num in range(len(pdf_document)):
                 page = pdf_document[page_num]
 
-                # Render page to pixmap (300 DPI for good quality)
-                zoom = 300 / 72  # 72 DPI is default
+                zoom = 300 / 72
                 mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat)
 
-                # Convert to PIL Image
                 img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
                 images.append(img)
 
@@ -143,15 +106,6 @@ class OCRProcessor:
             raise RuntimeError(f"Failed to convert PDF {pdf_path}: {e}")
 
     def _save_images(self, images: List[Image.Image], base_name: str) -> Path:
-        """Save extracted images to directory.
-
-        Args:
-            images: List of PIL Images
-            base_name: Base name for output files
-
-        Returns:
-            Path to images directory
-        """
         images_dir = self.output_dir / f"{base_name}_images"
         ensure_dir(images_dir)
 
@@ -166,42 +120,25 @@ class OCRProcessor:
     def process_file(
         self, file_path: Path, prompt: Optional[str] = None, show_progress: bool = True
     ) -> OCRResult:
-        """Process a single file (image or PDF).
-
-        Args:
-            file_path: Path to input file
-            prompt: Custom prompt for OCR
-            show_progress: Show progress bar for multi-page PDFs
-
-        Returns:
-            OCRResult instance
-
-        Raises:
-            FileNotFoundError: If file doesn't exist
-            RuntimeError: If processing fails
-        """
+        """Process a single file (image or PDF)."""
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
         logger.info(f"Processing file: {file_path}")
         start_time = datetime.now()
 
-        # Ensure model is loaded
         if self.model_manager.model is None:
             self.model_manager.load_model()
 
         try:
             if is_pdf_file(file_path):
-                # Convert PDF to images
                 images = self._pdf_to_images(file_path)
                 page_count = len(images)
 
-                # Optionally save images
                 if self.extract_images:
                     base_name = sanitize_filename(file_path.stem)
                     self._save_images(images, base_name)
 
-                # Process each page with progress bar
                 outputs = []
                 page_iterator = (
                     tqdm(enumerate(images, 1), total=page_count, desc="OCR pages", unit="page")
@@ -216,15 +153,12 @@ class OCRProcessor:
                 output_text = "\n\n".join(outputs)
 
             else:
-                # Process single image
                 image = load_image(file_path)
                 output_text = self.model_manager.process_image(image, prompt=prompt)
                 page_count = 1
 
-            # Calculate processing time
             processing_time = (datetime.now() - start_time).total_seconds()
 
-            # Create result
             metadata = {
                 "model": self.model_manager.model_name,
                 "backend": "ollama",
@@ -254,26 +188,13 @@ class OCRProcessor:
         prompt: Optional[str] = None,
         show_progress: bool = True,
     ) -> List[OCRResult]:
-        """Process multiple files from a directory.
-
-        Args:
-            input_path: File or directory path
-            recursive: Recursively search directories
-            prompt: Custom prompt for OCR
-            show_progress: Show progress bar
-
-        Returns:
-            List of OCRResult instances
-        """
-        # Collect files
+        """Process multiple files from a directory."""
         files = collect_files(input_path, recursive=recursive)
         logger.info(f"Found {len(files)} files to process")
 
-        # Ensure model is loaded
         if self.model_manager.model is None:
             self.model_manager.load_model()
 
-        # Process files
         results = []
         iterator = tqdm(files, desc="Processing files") if show_progress else files
 
@@ -281,8 +202,6 @@ class OCRProcessor:
             try:
                 result = self.process_file(file_path, prompt=prompt)
                 results.append(result)
-
-                # Save output immediately
                 self.save_result(result)
 
             except Exception as e:
@@ -293,23 +212,12 @@ class OCRProcessor:
         return results
 
     def save_result(self, result: OCRResult, output_path: Optional[Path] = None) -> Path:
-        """Save OCR result to markdown file.
-
-        Args:
-            result: OCRResult instance
-            output_path: Custom output path (if None, auto-generate)
-
-        Returns:
-            Path to saved file
-        """
         if output_path is None:
             base_name = sanitize_filename(result.input_path.stem)
             output_path = self.output_dir / f"{base_name}.md"
 
-        # Ensure output directory exists
         ensure_dir(output_path.parent)
 
-        # Write markdown
         markdown_content = result.to_markdown(include_metadata=self.include_metadata)
         output_path.write_text(markdown_content, encoding="utf-8")
 
