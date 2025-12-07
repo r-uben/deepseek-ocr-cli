@@ -81,6 +81,12 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     is_flag=True,
     help="Exclude metadata from output",
 )
+@click.option(
+    "--dpi",
+    type=int,
+    default=200,
+    help="PDF rendering DPI (default: 200, higher=slower but better quality)",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -92,6 +98,7 @@ def process(
     task: str,
     extract_images: bool,
     no_metadata: bool,
+    dpi: int,
 ) -> None:
     """Process documents and images with OCR.
 
@@ -123,6 +130,7 @@ def process(
             "model_manager": model_manager,
             "extract_images": extract_images,
             "include_metadata": not no_metadata,
+            "dpi": dpi,
         }
         if output_dir:
             processor_kwargs["output_dir"] = output_dir

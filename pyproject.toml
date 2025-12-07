@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "deepseek-ocr-cli"
-version = "0.2.2"
+version = "0.2.3"
 description = "CLI tool for OCR using DeepSeek-OCR model via Ollama"
 authors = ["Ruben Fernandez Fuertes <fernandezfuertesruben@gmail.com>"]
 readme = "README.md"

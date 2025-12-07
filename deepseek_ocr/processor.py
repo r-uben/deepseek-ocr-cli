@@ -68,18 +68,19 @@ class OCRProcessor:
         output_dir: Optional[Path] = None,
         extract_images: bool = False,
         include_metadata: bool = True,
+        dpi: int = 200,
     ):
         self.model_manager = model_manager or ModelManager()
         self.output_dir = output_dir or settings.output_dir
         self.extract_images = extract_images or settings.extract_images
         self.include_metadata = include_metadata and settings.include_metadata
+        self.dpi = dpi
 
         ensure_dir(self.output_dir)
         logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}")
 
     def _pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
-        """Convert PDF pages to images (200 DPI)."""
-        logger.debug(f"Converting PDF to images: {pdf_path}")
+        logger.debug(f"Converting PDF to images: {pdf_path} at {self.dpi} DPI")
 
         try:
             images = []
@@ -88,7 +89,7 @@ class OCRProcessor:
             for page_num in range(len(pdf_document)):
                 page = pdf_document[page_num]
 
-                zoom = 200 / 72
+                zoom = self.dpi / 72
                 mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat)
 

@@ -1,6 +1,6 @@
 """DeepSeek OCR CLI - Local OCR processing via Ollama."""
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 __author__ = "Ruben Fernandez Fuertes"
 __license__ = "MIT"
 
