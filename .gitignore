@@ -65,3 +65,4 @@ test_pdf_output/
 
 # Lock files (using poetry.lock in repo)
 uv.lock
+.claude/
