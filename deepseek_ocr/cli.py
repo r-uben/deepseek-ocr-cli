@@ -92,7 +92,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     "--workers",
     type=int,
     default=1,
-    help="Parallel workers for PDF pages (default: 1). Use 2-4 for speedup. Higher values may overload GPU.",
+    help="Parallel workers for PDF pages (default: 1). Note: Ollama processes sequentially, so >1 workers mainly overlap I/O, not GPU inference.",
 )
 @click.option(
     "--analyze-figures",
