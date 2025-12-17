@@ -1,9 +1,10 @@
 """Document processing and batch handling for DeepSeek OCR."""
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -69,15 +70,17 @@ class OCRProcessor:
         extract_images: bool = False,
         include_metadata: bool = True,
         dpi: int = 200,
+        workers: int = 1,
     ):
         self.model_manager = model_manager or ModelManager()
         self.output_dir = output_dir or settings.output_dir
         self.extract_images = extract_images or settings.extract_images
         self.include_metadata = include_metadata and settings.include_metadata
         self.dpi = dpi
+        self.workers = max(1, workers)  # Ensure at least 1 worker
 
         ensure_dir(self.output_dir)
-        logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}")
+        logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}, workers: {self.workers}")
 
     def _pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
         logger.debug(f"Converting PDF to images: {pdf_path} at {self.dpi} DPI")
@@ -118,6 +121,18 @@ class OCRProcessor:
         logger.info(f"Saved {len(images)} images to {images_dir}")
         return images_dir
 
+    def _process_single_page(
+        self, page_data: Tuple[int, Image.Image], prompt: Optional[str] = None
+    ) -> Tuple[int, str, Optional[str]]:
+        """Process a single page image. Returns (page_num, text, error)."""
+        page_num, image = page_data
+        try:
+            output = self.model_manager.process_image(image, prompt=prompt)
+            return (page_num, output, None)
+        except Exception as e:
+            logger.error(f"Failed to process page {page_num}: {e}")
+            return (page_num, "", str(e))
+
     def process_file(
         self, file_path: Path, prompt: Optional[str] = None, show_progress: bool = True
     ) -> OCRResult:
@@ -140,16 +155,58 @@ class OCRProcessor:
                     base_name = sanitize_filename(file_path.stem)
                     self._save_images(images, base_name)
 
-                outputs = []
-                page_iterator = (
-                    tqdm(enumerate(images, 1), total=page_count, desc="OCR pages", unit="page")
-                    if show_progress and page_count > 1
-                    else enumerate(images, 1)
-                )
-                for idx, image in page_iterator:
-                    logger.debug(f"Processing page {idx}/{page_count}")
-                    output = self.model_manager.process_image(image, prompt=prompt)
-                    outputs.append(f"## Page {idx}\n\n{output}")
+                # Prepare page data: (page_num, image) tuples
+                page_data = [(idx, img) for idx, img in enumerate(images, 1)]
+
+                if self.workers == 1:
+                    # Sequential processing (original behavior)
+                    outputs = []
+                    page_iterator = (
+                        tqdm(page_data, total=page_count, desc="OCR pages", unit="page")
+                        if show_progress and page_count > 1
+                        else page_data
+                    )
+                    for idx, image in page_iterator:
+                        logger.debug(f"Processing page {idx}/{page_count}")
+                        output = self.model_manager.process_image(image, prompt=prompt)
+                        outputs.append(f"## Page {idx}\n\n{output}")
+                else:
+                    # Parallel processing
+                    results_dict: Dict[int, str] = {}
+                    errors: List[str] = []
+
+                    with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                        futures = {
+                            executor.submit(self._process_single_page, pd, prompt): pd[0]
+                            for pd in page_data
+                        }
+
+                        if show_progress and page_count > 1:
+                            pbar = tqdm(total=page_count, desc=f"OCR pages ({self.workers}w)", unit="page")
+                        else:
+                            pbar = None
+
+                        for future in as_completed(futures):
+                            page_num, text, error = future.result()
+                            if error:
+                                errors.append(f"Page {page_num}: {error}")
+                                results_dict[page_num] = f"[OCR Error: {error}]"
+                            else:
+                                results_dict[page_num] = text
+                            if pbar:
+                                pbar.update(1)
+
+                        if pbar:
+                            pbar.close()
+
+                    if errors:
+                        logger.warning(f"Errors on {len(errors)} pages: {errors}")
+
+                    # Reassemble in page order
+                    outputs = [
+                        f"## Page {i}\n\n{results_dict[i]}"
+                        for i in sorted(results_dict.keys())
+                    ]
 
                 output_text = "\n\n".join(outputs)
 

@@ -12,6 +12,7 @@ Command-line tool for OCR using DeepSeek-OCR via Ollama. Runs locally with no AP
 - Powered by Ollama for efficient local inference
 - Supports PDFs and images (JPG, PNG, WEBP, GIF, BMP, TIFF)
 - Batch processing for multiple files and directories
+- Parallel page processing for faster PDF OCR
 - Clean markdown output with HTML tables converted to markdown
 - Progress tracking for multi-page PDFs
 - Terminal interface with progress bars and summary tables
@@ -73,6 +74,9 @@ deepseek-ocr form.jpg --prompt "Extract table data in markdown format"
 
 # Extract page images from PDF
 deepseek-ocr paper.pdf --extract-images
+
+# Parallel processing for faster PDF OCR (2-4 workers recommended)
+deepseek-ocr large-document.pdf -w 2
 ```
 
 ## CLI Options
@@ -89,6 +93,8 @@ Options:
                                   OCR task type
   --extract-images                Extract and save page images from PDFs
   --no-metadata                   Exclude metadata from output
+  --dpi INTEGER                   PDF rendering DPI (default: 200)
+  -w, --workers INTEGER           Parallel workers for PDF pages (default: 1)
   --verbose                       Enable verbose output
   --help                          Show this message and exit.
 ```
@@ -181,6 +187,7 @@ model_manager.load_model()
 processor = OCRProcessor(
     model_manager=model_manager,
     output_dir=Path("./results"),
+    workers=2,  # Parallel page processing (default: 1)
 )
 
 result = processor.process_file(Path("document.pdf"))

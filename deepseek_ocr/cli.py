@@ -87,6 +87,13 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     default=200,
     help="PDF rendering DPI (default: 200, higher=slower but better quality)",
 )
+@click.option(
+    "-w",
+    "--workers",
+    type=int,
+    default=1,
+    help="Parallel workers for PDF pages (default: 1). Use 2-4 for speedup. Higher values may overload GPU.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -99,6 +106,7 @@ def process(
     extract_images: bool,
     no_metadata: bool,
     dpi: int,
+    workers: int,
 ) -> None:
     """Process documents and images with OCR.
 
@@ -131,6 +139,7 @@ def process(
             "extract_images": extract_images,
             "include_metadata": not no_metadata,
             "dpi": dpi,
+            "workers": workers,
         }
         if output_dir:
             processor_kwargs["output_dir"] = output_dir
