@@ -24,6 +24,7 @@ def main() -> None:
         model_manager=model_manager,
         output_dir=Path("./output"),
         include_metadata=True,
+        workers=2,  # Parallel page processing (default: 1)
     )
 
     # Example 1: Process a single image (if available)
