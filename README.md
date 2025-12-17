@@ -77,6 +77,9 @@ deepseek-ocr paper.pdf --extract-images
 
 # Parallel processing for faster PDF OCR (2-4 workers recommended)
 deepseek-ocr large-document.pdf -w 2
+
+# Extract and analyze embedded figures with AI descriptions
+deepseek-ocr paper.pdf --analyze-figures
 ```
 
 ## CLI Options
@@ -95,6 +98,7 @@ Options:
   --no-metadata                   Exclude metadata from output
   --dpi INTEGER                   PDF rendering DPI (default: 200)
   -w, --workers INTEGER           Parallel workers for PDF pages (default: 1)
+  --analyze-figures               Extract and analyze embedded figures with AI
   --verbose                       Enable verbose output
   --help                          Show this message and exit.
 ```

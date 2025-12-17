@@ -1,7 +1,9 @@
 """Document processing and batch handling for DeepSeek OCR."""
 
+import io
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -21,6 +23,21 @@ from deepseek_ocr.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FigureInfo:
+    """Container for extracted figure information."""
+
+    page_num: int
+    figure_num: int
+    image: Image.Image
+    width: int
+    height: int
+    format: str
+    context: str = ""
+    description: str = ""
+    saved_path: Optional[Path] = None
 
 
 class OCRResult:
@@ -71,6 +88,7 @@ class OCRProcessor:
         include_metadata: bool = True,
         dpi: int = 200,
         workers: int = 1,
+        analyze_figures: bool = False,
     ):
         self.model_manager = model_manager or ModelManager()
         self.output_dir = output_dir or settings.output_dir
@@ -78,6 +96,7 @@ class OCRProcessor:
         self.include_metadata = include_metadata and settings.include_metadata
         self.dpi = dpi
         self.workers = max(1, workers)  # Ensure at least 1 worker
+        self.analyze_figures = analyze_figures
 
         ensure_dir(self.output_dir)
         logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}, workers: {self.workers}")
@@ -120,6 +139,171 @@ class OCRProcessor:
 
         logger.info(f"Saved {len(images)} images to {images_dir}")
         return images_dir
+
+    def _extract_figures_from_pdf(self, pdf_path: Path) -> List[FigureInfo]:
+        """Extract embedded figures/images from a PDF."""
+        figures: List[FigureInfo] = []
+
+        try:
+            doc = fitz.open(pdf_path)
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                page_text = page.get_text()
+                images = page.get_images(full=True)
+
+                for img_idx, img_info in enumerate(images):
+                    xref = img_info[0]
+
+                    try:
+                        base_image = doc.extract_image(xref)
+                        image_bytes = base_image["image"]
+
+                        # Convert to PIL Image
+                        pil_image = Image.open(io.BytesIO(image_bytes))
+                        if pil_image.mode != "RGB":
+                            pil_image = pil_image.convert("RGB")
+
+                        # Get context from surrounding text
+                        context = ""
+                        img_rects = page.get_image_rects(xref)
+                        if img_rects:
+                            rect = img_rects[0]
+                            # Expand rect to capture nearby text
+                            expanded_rect = fitz.Rect(
+                                max(0, rect.x0 - 50),
+                                max(0, rect.y0 - 150),
+                                rect.x1 + 50,
+                                rect.y1 + 150
+                            )
+                            context = page.get_text("text", clip=expanded_rect).strip()
+
+                        # Fallback to full page text if no local context
+                        if not context:
+                            context = page_text[:500].strip() if page_text else ""
+
+                        figure = FigureInfo(
+                            page_num=page_num + 1,
+                            figure_num=img_idx + 1,
+                            image=pil_image,
+                            width=base_image["width"],
+                            height=base_image["height"],
+                            format=base_image["ext"],
+                            context=context,
+                        )
+                        figures.append(figure)
+
+                    except Exception as e:
+                        logger.warning(f"Failed to extract image {img_idx + 1} from page {page_num + 1}: {e}")
+                        continue
+
+            doc.close()
+            logger.info(f"Extracted {len(figures)} figures from {pdf_path.name}")
+
+        except Exception as e:
+            logger.error(f"Failed to extract figures from {pdf_path}: {e}")
+
+        return figures
+
+    def _save_figures(self, figures: List[FigureInfo], base_name: str) -> Path:
+        """Save extracted figures to disk."""
+        figures_dir = self.output_dir / f"{base_name}_figures"
+        ensure_dir(figures_dir)
+
+        for fig in figures:
+            filename = f"page{fig.page_num}_fig{fig.figure_num}.{fig.format}"
+            fig_path = figures_dir / filename
+            fig.image.save(fig_path)
+            fig.saved_path = fig_path
+            logger.debug(f"Saved figure: {fig_path}")
+
+        logger.info(f"Saved {len(figures)} figures to {figures_dir}")
+        return figures_dir
+
+    def _analyze_single_figure(
+        self, figure: FigureInfo
+    ) -> Tuple[int, int, str, Optional[str]]:
+        """Analyze a single figure. Returns (page_num, fig_num, description, error)."""
+        try:
+            # Build prompt with context
+            if figure.context:
+                prompt = (
+                    f"This figure appears in a document with the following context:\n"
+                    f"---\n{figure.context[:500]}\n---\n\n"
+                    f"Describe what this figure shows. Include details about any charts, "
+                    f"graphs, diagrams, or visual elements. Explain what it represents "
+                    f"in the context of the document."
+                )
+            else:
+                prompt = (
+                    "Describe this figure in detail. Include information about any charts, "
+                    "graphs, diagrams, tables, or visual elements. Explain what it represents."
+                )
+
+            description = self.model_manager.process_image(figure.image, prompt=prompt)
+            return (figure.page_num, figure.figure_num, description, None)
+
+        except Exception as e:
+            logger.error(f"Failed to analyze figure {figure.figure_num} on page {figure.page_num}: {e}")
+            return (figure.page_num, figure.figure_num, "", str(e))
+
+    def _analyze_figures(
+        self, figures: List[FigureInfo], show_progress: bool = True
+    ) -> List[FigureInfo]:
+        """Analyze all figures and populate their descriptions."""
+        if not figures:
+            return figures
+
+        if self.workers == 1:
+            # Sequential processing
+            fig_iterator = (
+                tqdm(figures, desc="Analyzing figures", unit="fig")
+                if show_progress and len(figures) > 1
+                else figures
+            )
+            for fig in fig_iterator:
+                _, _, description, error = self._analyze_single_figure(fig)
+                fig.description = description if not error else f"[Analysis Error: {error}]"
+        else:
+            # Parallel processing
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = {
+                    executor.submit(self._analyze_single_figure, fig): fig
+                    for fig in figures
+                }
+
+                if show_progress and len(figures) > 1:
+                    pbar = tqdm(total=len(figures), desc=f"Analyzing figures ({self.workers}w)", unit="fig")
+                else:
+                    pbar = None
+
+                for future in as_completed(futures):
+                    fig = futures[future]
+                    _, _, description, error = future.result()
+                    fig.description = description if not error else f"[Analysis Error: {error}]"
+                    if pbar:
+                        pbar.update(1)
+
+                if pbar:
+                    pbar.close()
+
+        return figures
+
+    def _figures_to_markdown(self, figures: List[FigureInfo]) -> str:
+        """Convert figure analyses to markdown."""
+        if not figures:
+            return ""
+
+        lines = ["\n\n---\n\n# Figures\n"]
+
+        for fig in figures:
+            lines.append(f"\n## Figure {fig.figure_num} (Page {fig.page_num})\n")
+            if fig.saved_path:
+                lines.append(f"*Saved to: {fig.saved_path.name}*\n")
+            lines.append(f"*Size: {fig.width}x{fig.height} ({fig.format})*\n")
+            lines.append(f"\n{fig.description}\n")
+
+        return "\n".join(lines)
 
     def _process_single_page(
         self, page_data: Tuple[int, Image.Image], prompt: Optional[str] = None
@@ -209,6 +393,15 @@ class OCRProcessor:
                     ]
 
                 output_text = "\n\n".join(outputs)
+
+                # Extract and analyze figures if enabled
+                if self.analyze_figures:
+                    figures = self._extract_figures_from_pdf(file_path)
+                    if figures:
+                        base_name = sanitize_filename(file_path.stem)
+                        self._save_figures(figures, base_name)
+                        self._analyze_figures(figures, show_progress=show_progress)
+                        output_text += self._figures_to_markdown(figures)
 
             else:
                 image = load_image(file_path)

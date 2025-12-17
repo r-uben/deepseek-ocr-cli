@@ -94,6 +94,11 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     default=1,
     help="Parallel workers for PDF pages (default: 1). Use 2-4 for speedup. Higher values may overload GPU.",
 )
+@click.option(
+    "--analyze-figures",
+    is_flag=True,
+    help="Extract and analyze embedded figures/images from PDFs with AI descriptions.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -107,6 +112,7 @@ def process(
     no_metadata: bool,
     dpi: int,
     workers: int,
+    analyze_figures: bool,
 ) -> None:
     """Process documents and images with OCR.
 
@@ -140,6 +146,7 @@ def process(
             "include_metadata": not no_metadata,
             "dpi": dpi,
             "workers": workers,
+            "analyze_figures": analyze_figures,
         }
         if output_dir:
             processor_kwargs["output_dir"] = output_dir
