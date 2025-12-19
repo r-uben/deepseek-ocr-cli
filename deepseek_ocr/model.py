@@ -99,7 +99,7 @@ class ModelManager:
         **kwargs,
     ):
         self.model_name = model_name
-        self.ollama_url = ollama_url or OLLAMA_API_URL
+        self.ollama_url = ollama_url or getattr(settings, "ollama_url", OLLAMA_API_URL)
         self.model: bool = False
         self.device = "ollama"
         self.resolution = getattr(settings, "resolution", None)
