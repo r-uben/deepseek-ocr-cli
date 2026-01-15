@@ -10,6 +10,7 @@ import requests
 from PIL import Image
 
 from deepseek_ocr.config import settings
+from deepseek_ocr.utils import resize_image_if_needed
 
 logger = logging.getLogger(__name__)
 
@@ -96,10 +97,12 @@ class ModelManager:
         self,
         model_name: str = "deepseek-ocr",
         ollama_url: Optional[str] = None,
+        max_dimension: Optional[int] = None,
         **kwargs,
     ):
         self.model_name = model_name
         self.ollama_url = ollama_url or OLLAMA_API_URL
+        self.max_dimension = max_dimension if max_dimension is not None else settings.max_dimension
         self.model: bool = False
         self.device = "ollama"
         self.resolution = getattr(settings, "resolution", None)
@@ -185,6 +188,7 @@ class ModelManager:
         logger.debug(f"Processing image with prompt: {prompt}")
 
         try:
+            image = resize_image_if_needed(image, self.max_dimension)
             image_b64 = self._image_to_base64(image)
 
             response = requests.post(

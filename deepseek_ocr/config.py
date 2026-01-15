@@ -26,6 +26,12 @@ class Settings(BaseSettings):
         description="Ollama API URL",
     )
 
+    # Image preprocessing
+    max_dimension: int = Field(
+        default=1920,
+        description="Maximum image dimension (width or height). Larger images are resized to prevent Ollama timeouts. Set to 0 to disable.",
+    )
+
     # Output configuration
     output_dir: Path = Field(
         default=Path("output"),

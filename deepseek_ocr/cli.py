@@ -99,6 +99,13 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     is_flag=True,
     help="Extract and analyze embedded figures/images from PDFs with AI descriptions.",
 )
+@click.option(
+    "--max-dim",
+    "max_dimension",
+    type=int,
+    default=None,
+    help="Maximum image dimension (width or height). Larger images are resized to prevent Ollama timeouts. Default: 1920. Set to 0 to disable.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -113,6 +120,7 @@ def process(
     dpi: int,
     workers: int,
     analyze_figures: bool,
+    max_dimension: Optional[int],
 ) -> None:
     """Process documents and images with OCR.
 
@@ -137,7 +145,7 @@ def process(
     print_banner()
 
     try:
-        model_manager = ModelManager(model_name=model_name)
+        model_manager = ModelManager(model_name=model_name, max_dimension=max_dimension)
         model_manager.load_model()
 
         processor_kwargs = {
@@ -214,6 +222,7 @@ def info() -> None:
     settings_table.add_row("Model", settings.model_name)
     settings_table.add_row("Output Directory", str(settings.output_dir))
     settings_table.add_row("Extract Images", str(settings.extract_images))
+    settings_table.add_row("Max Image Dimension", str(settings.max_dimension))
 
     console.print(settings_table)
 

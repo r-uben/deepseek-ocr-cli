@@ -75,6 +75,37 @@ def load_image(image_path: Path) -> Image.Image:
         raise ValueError(f"Failed to load image {image_path}: {e}")
 
 
+def resize_image_if_needed(image: Image.Image, max_dimension: int) -> Image.Image:
+    """Resize image if it exceeds max_dimension to prevent Ollama timeouts.
+
+    Large images create massive base64 payloads that can cause Ollama to hang.
+    This resizes proportionally while preserving aspect ratio.
+
+    Args:
+        image: PIL Image to potentially resize
+        max_dimension: Maximum allowed width or height. 0 disables resizing.
+
+    Returns:
+        Resized image if needed, otherwise the original image
+    """
+    if max_dimension <= 0:
+        return image
+
+    width, height = image.size
+    if max(width, height) <= max_dimension:
+        return image
+
+    ratio = max_dimension / max(width, height)
+    new_size = (int(width * ratio), int(height * ratio))
+
+    logging.getLogger(__name__).info(
+        f"Resizing image from {width}x{height} to {new_size[0]}x{new_size[1]} "
+        f"(max_dimension={max_dimension})"
+    )
+
+    return image.resize(new_size, Image.Resampling.LANCZOS)
+
+
 def sanitize_filename(filename: str) -> str:
     invalid_chars = '<>:"/\\|?*'
     for char in invalid_chars:
