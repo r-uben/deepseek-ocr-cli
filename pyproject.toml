@@ -34,6 +34,10 @@ pydantic-settings = "^2.7.0"
 pymupdf = "^1.25.1"
 rich = "^13.9.4"
 requests = "^2.31.0"
+openai = {version = "^1.0.0", optional = true}
+
+[tool.poetry.extras]
+vllm = ["openai"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.4"

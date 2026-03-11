@@ -1,6 +1,7 @@
-"""Configuration management for DeepSeek OCR CLI (Ollama backend)."""
+"""Configuration management for DeepSeek OCR CLI."""
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,14 +17,24 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
+    # Backend selection
+    backend: Literal["ollama", "vllm"] = Field(
+        default="ollama",
+        description="Backend to use: 'ollama' (local) or 'vllm' (OpenAI-compatible)",
+    )
+
     # Model configuration
     model_name: str = Field(
         default="deepseek-ocr",
-        description="Ollama model name",
+        description="Model name (deepseek-ocr for Ollama, deepseek-vl2 for vLLM)",
     )
     ollama_url: str = Field(
         default="http://localhost:11434",
         description="Ollama API URL",
+    )
+    vllm_base_url: str = Field(
+        default="http://localhost:8000/v1",
+        description="vLLM OpenAI-compatible API URL",
     )
 
     # Image preprocessing

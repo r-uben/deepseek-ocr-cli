@@ -1,4 +1,4 @@
-"""Command-line interface for DeepSeek OCR via Ollama."""
+"""Command-line interface for DeepSeek OCR."""
 
 import sys
 from pathlib import Path
@@ -9,8 +9,8 @@ from rich.console import Console
 from rich.table import Table
 
 from deepseek_ocr import __version__
+from deepseek_ocr.backends import create_backend
 from deepseek_ocr.config import settings
-from deepseek_ocr.model import ModelManager
 from deepseek_ocr.processor import OCRProcessor
 from deepseek_ocr.utils import setup_logging
 
@@ -30,9 +30,9 @@ def print_banner() -> None:
 )
 @click.pass_context
 def cli(ctx: click.Context, verbose: bool) -> None:
-    """DeepSeek OCR CLI - Local OCR processing via Ollama.
+    """DeepSeek OCR CLI - OCR processing via Ollama or vLLM.
 
-    Requires Ollama to be running with deepseek-ocr model pulled.
+    Supports Ollama (local, default) and vLLM (OpenAI-compatible API) backends.
     """
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
@@ -104,7 +104,20 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     "max_dimension",
     type=int,
     default=None,
-    help="Maximum image dimension (width or height). Larger images are resized to prevent Ollama timeouts. Default: 1920. Set to 0 to disable.",
+    help="Maximum image dimension (width or height). Larger images are resized to prevent timeouts. Default: 1920. Set to 0 to disable.",
+)
+@click.option(
+    "--backend",
+    type=click.Choice(["ollama", "vllm"]),
+    default=None,
+    help="Backend to use: 'ollama' (local, default) or 'vllm' (OpenAI-compatible). Can also set DEEPSEEK_OCR_BACKEND env var.",
+)
+@click.option(
+    "--vllm-url",
+    "vllm_base_url",
+    type=str,
+    default=None,
+    help="vLLM API URL (default: http://localhost:8000/v1). Can also set DEEPSEEK_OCR_VLLM_BASE_URL env var.",
 )
 @click.pass_context
 def process(
@@ -121,6 +134,8 @@ def process(
     workers: int,
     analyze_figures: bool,
     max_dimension: Optional[int],
+    backend: Optional[str],
+    vllm_base_url: Optional[str],
 ) -> None:
     """Process documents and images with OCR.
 
@@ -144,12 +159,25 @@ def process(
     """
     print_banner()
 
+    # Resolve backend from CLI flag or config
+    backend_type = backend or settings.backend
+
+    # For vLLM, default model is deepseek-vl2 unless explicitly specified
+    if backend_type == "vllm" and model_name == "deepseek-ocr":
+        model_name = "deepseek-vl2"
+
     try:
-        model_manager = ModelManager(model_name=model_name, max_dimension=max_dimension)
-        model_manager.load_model()
+        backend_instance = create_backend(
+            backend_type=backend_type,
+            model_name=model_name,
+            max_dimension=max_dimension,
+            ollama_url=settings.ollama_url,
+            vllm_base_url=vllm_base_url or settings.vllm_base_url,
+        )
+        backend_instance.load_model()
 
         processor_kwargs = {
-            "model_manager": model_manager,
+            "backend": backend_instance,
             "extract_images": extract_images,
             "include_metadata": not no_metadata,
             "dpi": dpi,
@@ -187,7 +215,7 @@ def process(
 
             console.print(table)
 
-        model_manager.unload_model()
+        backend_instance.unload_model()
 
     except Exception as e:
         console.print(f"[red]error:[/red] {e}")
@@ -204,14 +232,19 @@ def info() -> None:
     sys_table.add_column("Status", style="green")
 
     sys_table.add_row("Python", f"{sys.version_info.major}.{sys.version_info.minor}")
+    sys_table.add_row("Backend", settings.backend)
+
+    # Check Ollama status
+    from deepseek_ocr.backends.ollama import OllamaBackend
+
+    ollama_backend = OllamaBackend()
+    ollama_running = ollama_backend._check_ollama_running()
+    ollama_model_available = ollama_backend._check_model_available() if ollama_running else False
+
     sys_table.add_row("Ollama URL", settings.ollama_url)
-
-    model_manager = ModelManager()
-    ollama_running = model_manager._check_ollama_running()
-    model_available = model_manager._check_model_available() if ollama_running else False
-
     sys_table.add_row("Ollama Running", "Yes" if ollama_running else "No")
-    sys_table.add_row("deepseek-ocr Model", "Available" if model_available else "Not found")
+    sys_table.add_row("deepseek-ocr Model", "Available" if ollama_model_available else "Not found")
+    sys_table.add_row("vLLM URL", settings.vllm_base_url)
 
     console.print(sys_table)
 
@@ -230,10 +263,15 @@ def info() -> None:
     console.print("Images: JPG, PNG, WEBP, GIF, BMP, TIFF")
     console.print("Documents: PDF\n")
 
-    if not ollama_running:
-        console.print("[yellow]⚠ Ollama is not running. Start with: ollama serve[/yellow]\n")
-    elif not model_available:
-        console.print("[yellow]⚠ Model not found. Pull with: ollama pull deepseek-ocr[/yellow]\n")
+    console.print("[bold]Backend Options:[/bold]")
+    console.print("  --backend ollama  Local processing (default)")
+    console.print("  --backend vllm    OpenAI-compatible API (GPU server)\n")
+
+    if settings.backend == "ollama":
+        if not ollama_running:
+            console.print("[yellow]Ollama is not running. Start with: ollama serve[/yellow]\n")
+        elif not ollama_model_available:
+            console.print("[yellow]Model not found. Pull with: ollama pull deepseek-ocr[/yellow]\n")
 
 
 def main() -> None:

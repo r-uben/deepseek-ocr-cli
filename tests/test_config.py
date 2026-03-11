@@ -1,28 +1,8 @@
 """Tests for configuration management."""
 
-import pytest
 from pathlib import Path
-from deepseek_ocr.config import Resolution, DeviceType, Settings
 
-
-class TestResolution:
-    """Tests for Resolution enum."""
-
-    def test_all_resolutions_exist(self) -> None:
-        """Test that all expected resolutions are defined."""
-        expected = {"tiny", "small", "base", "large", "gundam"}
-        actual = {r.value for r in Resolution}
-        assert actual == expected
-
-
-class TestDeviceType:
-    """Tests for DeviceType enum."""
-
-    def test_all_device_types_exist(self) -> None:
-        """Test that all expected device types are defined."""
-        expected = {"auto", "cpu", "mps", "cuda"}
-        actual = {d.value for d in DeviceType}
-        assert actual == expected
+from deepseek_ocr.config import Settings
 
 
 class TestSettings:
@@ -31,18 +11,19 @@ class TestSettings:
     def test_default_settings(self) -> None:
         """Test that default settings are correct."""
         settings = Settings()
-        assert settings.model_name == "deepseek-ai/DeepSeek-OCR"
-        assert settings.resolution == Resolution.BASE
-        assert settings.device == DeviceType.AUTO
-        assert settings.batch_size >= 1
+        assert settings.model_name == "deepseek-ocr"
+        assert settings.backend == "ollama"
+        assert settings.ollama_url == "http://localhost:11434"
+        assert settings.vllm_base_url == "http://localhost:8000/v1"
+        assert settings.max_dimension == 1920
         assert settings.output_dir == Path("output")
+        assert settings.extract_images is False
+        assert settings.include_metadata is True
 
-    def test_settings_validation(self) -> None:
-        """Test that settings validation works."""
-        with pytest.raises(Exception):
-            # Batch size must be >= 1
-            Settings(batch_size=0)
+    def test_backend_choices(self) -> None:
+        """Test that backend only accepts valid choices."""
+        settings = Settings(backend="ollama")
+        assert settings.backend == "ollama"
 
-        with pytest.raises(Exception):
-            # Max workers must be >= 1
-            Settings(max_workers=0)
+        settings = Settings(backend="vllm")
+        assert settings.backend == "vllm"

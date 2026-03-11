@@ -6,14 +6,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import fitz  # PyMuPDF
 from PIL import Image
 from tqdm import tqdm
 
 from deepseek_ocr.config import settings
-from deepseek_ocr.model import ModelManager
 from deepseek_ocr.utils import (
     collect_files,
     ensure_dir,
@@ -21,6 +20,10 @@ from deepseek_ocr.utils import (
     load_image,
     sanitize_filename,
 )
+
+if TYPE_CHECKING:
+    from deepseek_ocr.backends.base import Backend
+    from deepseek_ocr.model import ModelManager
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +85,8 @@ class OCRProcessor:
 
     def __init__(
         self,
-        model_manager: Optional[ModelManager] = None,
+        backend: Optional["Backend"] = None,
+        model_manager: Optional["ModelManager"] = None,  # Deprecated, for backward compat
         output_dir: Optional[Path] = None,
         extract_images: bool = False,
         include_metadata: bool = True,
@@ -90,7 +94,18 @@ class OCRProcessor:
         workers: int = 1,
         analyze_figures: bool = False,
     ):
-        self.model_manager = model_manager or ModelManager()
+        # Accept either backend or model_manager for backward compatibility
+        if backend is not None:
+            self._backend = backend
+        elif model_manager is not None:
+            # model_manager is actually a Backend (ModelManager wraps Backend)
+            self._backend = model_manager
+        else:
+            # Default to Ollama backend
+            from deepseek_ocr.backends import create_backend
+
+            self._backend = create_backend()
+
         self.output_dir = output_dir or settings.output_dir
         self.extract_images = extract_images or settings.extract_images
         self.include_metadata = include_metadata and settings.include_metadata
@@ -100,6 +115,11 @@ class OCRProcessor:
 
         ensure_dir(self.output_dir)
         logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}, workers: {self.workers}")
+
+    @property
+    def model_manager(self) -> Union["Backend", "ModelManager"]:
+        """Backward-compatible property."""
+        return self._backend
 
     def _pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
         logger.debug(f"Converting PDF to images: {pdf_path} at {self.dpi} DPI")
@@ -240,7 +260,7 @@ class OCRProcessor:
                     "graphs, diagrams, tables, or visual elements. Explain what it represents."
                 )
 
-            description = self.model_manager.process_image(figure.image, prompt=prompt)
+            description = self._backend.process_image(figure.image, prompt=prompt)
             return (figure.page_num, figure.figure_num, description, None)
 
         except Exception as e:
@@ -311,7 +331,7 @@ class OCRProcessor:
         """Process a single page image. Returns (page_num, text, error)."""
         page_num, image = page_data
         try:
-            output = self.model_manager.process_image(image, prompt=prompt)
+            output = self._backend.process_image(image, prompt=prompt)
             return (page_num, output, None)
         except Exception as e:
             logger.error(f"Failed to process page {page_num}: {e}")
@@ -327,8 +347,8 @@ class OCRProcessor:
         logger.info(f"Processing file: {file_path}")
         start_time = datetime.now()
 
-        if self.model_manager.model is None:
-            self.model_manager.load_model()
+        if self._backend.model is None:
+            self._backend.load_model()
 
         try:
             if is_pdf_file(file_path):
@@ -352,7 +372,7 @@ class OCRProcessor:
                     )
                     for idx, image in page_iterator:
                         logger.debug(f"Processing page {idx}/{page_count}")
-                        output = self.model_manager.process_image(image, prompt=prompt)
+                        output = self._backend.process_image(image, prompt=prompt)
                         outputs.append(f"## Page {idx}\n\n{output}")
                 else:
                     # Parallel processing
@@ -405,14 +425,14 @@ class OCRProcessor:
 
             else:
                 image = load_image(file_path)
-                output_text = self.model_manager.process_image(image, prompt=prompt)
+                output_text = self._backend.process_image(image, prompt=prompt)
                 page_count = 1
 
             processing_time = (datetime.now() - start_time).total_seconds()
 
             metadata = {
-                "model": self.model_manager.model_name,
-                "backend": "ollama",
+                "model": self._backend.model_name,
+                "backend": getattr(self._backend, "backend_name", "ollama"),
             }
 
             result = OCRResult(
@@ -443,8 +463,8 @@ class OCRProcessor:
         files = collect_files(input_path, recursive=recursive)
         logger.info(f"Found {len(files)} files to process")
 
-        if self.model_manager.model is None:
-            self.model_manager.load_model()
+        if self._backend.model is None:
+            self._backend.load_model()
 
         results = []
         iterator = tqdm(files, desc="Processing files") if show_progress else files

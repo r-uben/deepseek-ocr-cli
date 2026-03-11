@@ -81,7 +81,12 @@ OLLAMA_API_URL = "http://localhost:11434"
 
 
 class ModelManager:
-    """Manages DeepSeek-OCR model inference via Ollama."""
+    """Manages DeepSeek-OCR model inference via Ollama.
+
+    Note: This class is maintained for backward compatibility.
+    For new code, consider using the backend classes directly:
+        from deepseek_ocr.backends import create_backend, OllamaBackend, VLLMBackend
+    """
 
     # Default prompts for different OCR tasks
     PROMPTS = {
@@ -111,6 +116,11 @@ class ModelManager:
             logger.debug(f"Ignoring legacy kwargs: {list(kwargs.keys())}")
 
         logger.info(f"Initialized ModelManager with Ollama model: {self.model_name}")
+
+    @property
+    def backend_name(self) -> str:
+        """Return the backend identifier for compatibility with Backend interface."""
+        return "ollama"
 
     def _check_ollama_running(self) -> bool:
         try:
