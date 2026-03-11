@@ -13,6 +13,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from deepseek_ocr.config import settings
+from deepseek_ocr.metadata import MetadataManager
 from deepseek_ocr.utils import (
     collect_files,
     ensure_dir,
@@ -98,10 +99,8 @@ class OCRProcessor:
         if backend is not None:
             self._backend = backend
         elif model_manager is not None:
-            # model_manager is actually a Backend (ModelManager wraps Backend)
             self._backend = model_manager
         else:
-            # Default to Ollama backend
             from deepseek_ocr.backends import create_backend
 
             self._backend = create_backend()
@@ -110,7 +109,7 @@ class OCRProcessor:
         self.extract_images = extract_images or settings.extract_images
         self.include_metadata = include_metadata and settings.include_metadata
         self.dpi = dpi
-        self.workers = max(1, workers)  # Ensure at least 1 worker
+        self.workers = max(1, workers)
         self.analyze_figures = analyze_figures
 
         ensure_dir(self.output_dir)
@@ -179,17 +178,14 @@ class OCRProcessor:
                         base_image = doc.extract_image(xref)
                         image_bytes = base_image["image"]
 
-                        # Convert to PIL Image
                         pil_image = Image.open(io.BytesIO(image_bytes))
                         if pil_image.mode != "RGB":
                             pil_image = pil_image.convert("RGB")
 
-                        # Get context from surrounding text
                         context = ""
                         img_rects = page.get_image_rects(xref)
                         if img_rects:
                             rect = img_rects[0]
-                            # Expand rect to capture nearby text
                             expanded_rect = fitz.Rect(
                                 max(0, rect.x0 - 50),
                                 max(0, rect.y0 - 150),
@@ -198,7 +194,6 @@ class OCRProcessor:
                             )
                             context = page.get_text("text", clip=expanded_rect).strip()
 
-                        # Fallback to full page text if no local context
                         if not context:
                             context = page_text[:500].strip() if page_text else ""
 
@@ -245,7 +240,6 @@ class OCRProcessor:
     ) -> Tuple[int, int, str, Optional[str]]:
         """Analyze a single figure. Returns (page_num, fig_num, description, error)."""
         try:
-            # Build prompt with context
             if figure.context:
                 prompt = (
                     f"This figure appears in a document with the following context:\n"
@@ -275,7 +269,6 @@ class OCRProcessor:
             return figures
 
         if self.workers == 1:
-            # Sequential processing
             fig_iterator = (
                 tqdm(figures, desc="Analyzing figures", unit="fig")
                 if show_progress and len(figures) > 1
@@ -285,7 +278,6 @@ class OCRProcessor:
                 _, _, description, error = self._analyze_single_figure(fig)
                 fig.description = description if not error else f"[Analysis Error: {error}]"
         else:
-            # Parallel processing
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = {
                     executor.submit(self._analyze_single_figure, fig): fig
@@ -359,11 +351,9 @@ class OCRProcessor:
                     base_name = sanitize_filename(file_path.stem)
                     self._save_images(images, base_name)
 
-                # Prepare page data: (page_num, image) tuples
                 page_data = [(idx, img) for idx, img in enumerate(images, 1)]
 
                 if self.workers == 1:
-                    # Sequential processing (original behavior)
                     outputs = []
                     page_iterator = (
                         tqdm(page_data, total=page_count, desc="OCR pages", unit="page")
@@ -375,7 +365,6 @@ class OCRProcessor:
                         output = self._backend.process_image(image, prompt=prompt)
                         outputs.append(f"## Page {idx}\n\n{output}")
                 else:
-                    # Parallel processing
                     results_dict: Dict[int, str] = {}
                     errors: List[str] = []
 
@@ -406,7 +395,6 @@ class OCRProcessor:
                     if errors:
                         logger.warning(f"Errors on {len(errors)} pages: {errors}")
 
-                    # Reassemble in page order
                     outputs = [
                         f"## Page {i}\n\n{results_dict[i]}"
                         for i in sorted(results_dict.keys())
@@ -414,7 +402,6 @@ class OCRProcessor:
 
                 output_text = "\n\n".join(outputs)
 
-                # Extract and analyze figures if enabled
                 if self.analyze_figures:
                     figures = self._extract_figures_from_pdf(file_path)
                     if figures:
@@ -458,10 +445,30 @@ class OCRProcessor:
         recursive: bool = False,
         prompt: Optional[str] = None,
         show_progress: bool = True,
+        reprocess: bool = False,
     ) -> List[OCRResult]:
-        """Process multiple files from a directory."""
+        """Process multiple files from a directory.
+
+        Args:
+            reprocess: If True, reprocess files even if already in metadata.
+        """
         files = collect_files(input_path, recursive=recursive)
         logger.info(f"Found {len(files)} files to process")
+
+        metadata = MetadataManager(self.output_dir)
+
+        # Filter already-processed files unless reprocess is requested
+        if not reprocess:
+            to_process = []
+            skipped = 0
+            for f in files:
+                if metadata.is_processed(f):
+                    skipped += 1
+                else:
+                    to_process.append(f)
+            if skipped:
+                logger.info(f"Skipping {skipped} already-processed files")
+            files = to_process
 
         if self._backend.model is None:
             self._backend.load_model()
@@ -473,7 +480,16 @@ class OCRProcessor:
             try:
                 result = self.process_file(file_path, prompt=prompt)
                 results.append(result)
-                self.save_result(result)
+                output_path = self.save_result(result)
+
+                metadata.record(
+                    file_path,
+                    pages=result.page_count,
+                    processing_time=result.processing_time,
+                    model=result.metadata.get("model", ""),
+                    backend=result.metadata.get("backend", ""),
+                    output_path=str(output_path.relative_to(self.output_dir)),
+                )
 
             except Exception as e:
                 logger.error(f"Failed to process {file_path}: {e}")

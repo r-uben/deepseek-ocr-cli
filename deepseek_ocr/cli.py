@@ -119,6 +119,11 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     default=None,
     help="vLLM API URL (default: http://localhost:8000/v1). Can also set DEEPSEEK_OCR_VLLM_BASE_URL env var.",
 )
+@click.option(
+    "--reprocess",
+    is_flag=True,
+    help="Force reprocessing of already-processed files in batch mode.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -136,6 +141,7 @@ def process(
     max_dimension: Optional[int],
     backend: Optional[str],
     vllm_base_url: Optional[str],
+    reprocess: bool,
 ) -> None:
     """Process documents and images with OCR.
 
@@ -199,6 +205,7 @@ def process(
                 recursive=recursive,
                 prompt=prompt,
                 show_progress=not ctx.obj["verbose"],
+                reprocess=reprocess,
             )
 
             table = Table(show_header=True, header_style="bold")
