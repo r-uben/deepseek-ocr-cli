@@ -106,6 +106,11 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     default=None,
     help="Maximum image dimension (width or height). Larger images are resized to prevent Ollama timeouts. Default: 1920. Set to 0 to disable.",
 )
+@click.option(
+    "--reprocess",
+    is_flag=True,
+    help="Force reprocessing of already-processed files in batch mode.",
+)
 @click.pass_context
 def process(
     ctx: click.Context,
@@ -121,6 +126,7 @@ def process(
     workers: int,
     analyze_figures: bool,
     max_dimension: Optional[int],
+    reprocess: bool,
 ) -> None:
     """Process documents and images with OCR.
 
@@ -171,6 +177,7 @@ def process(
                 recursive=recursive,
                 prompt=prompt,
                 show_progress=not ctx.obj["verbose"],
+                reprocess=reprocess,
             )
 
             table = Table(show_header=True, header_style="bold")

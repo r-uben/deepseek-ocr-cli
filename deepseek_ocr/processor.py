@@ -13,6 +13,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from deepseek_ocr.config import settings
+from deepseek_ocr.metadata import MetadataManager
 from deepseek_ocr.model import ModelManager
 from deepseek_ocr.utils import (
     collect_files,
@@ -438,10 +439,30 @@ class OCRProcessor:
         recursive: bool = False,
         prompt: Optional[str] = None,
         show_progress: bool = True,
+        reprocess: bool = False,
     ) -> List[OCRResult]:
-        """Process multiple files from a directory."""
+        """Process multiple files from a directory.
+
+        Args:
+            reprocess: If True, reprocess files even if already in metadata.
+        """
         files = collect_files(input_path, recursive=recursive)
         logger.info(f"Found {len(files)} files to process")
+
+        metadata = MetadataManager(self.output_dir)
+
+        # Filter already-processed files unless reprocess is requested
+        if not reprocess:
+            to_process = []
+            skipped = 0
+            for f in files:
+                if metadata.is_processed(f):
+                    skipped += 1
+                else:
+                    to_process.append(f)
+            if skipped:
+                logger.info(f"Skipping {skipped} already-processed files")
+            files = to_process
 
         if self.model_manager.model is None:
             self.model_manager.load_model()
@@ -453,7 +474,16 @@ class OCRProcessor:
             try:
                 result = self.process_file(file_path, prompt=prompt)
                 results.append(result)
-                self.save_result(result)
+                output_path = self.save_result(result)
+
+                metadata.record(
+                    file_path,
+                    pages=result.page_count,
+                    processing_time=result.processing_time,
+                    model=result.metadata.get("model", ""),
+                    backend=result.metadata.get("backend", ""),
+                    output_path=str(output_path.relative_to(self.output_dir)),
+                )
 
             except Exception as e:
                 logger.error(f"Failed to process {file_path}: {e}")
