@@ -129,7 +129,7 @@ class OCRProcessor:
             raise RuntimeError(f"Failed to convert PDF {pdf_path}: {e}")
 
     def _save_images(self, images: List[Image.Image], base_name: str) -> Path:
-        images_dir = self.output_dir / f"{base_name}_images"
+        images_dir = self.output_dir / base_name / "images"
         ensure_dir(images_dir)
 
         for idx, image in enumerate(images, 1):
@@ -207,7 +207,7 @@ class OCRProcessor:
 
     def _save_figures(self, figures: List[FigureInfo], base_name: str) -> Path:
         """Save extracted figures to disk."""
-        figures_dir = self.output_dir / f"{base_name}_figures"
+        figures_dir = self.output_dir / base_name / "figures"
         ensure_dir(figures_dir)
 
         for fig in figures:
@@ -299,7 +299,7 @@ class OCRProcessor:
         for fig in figures:
             lines.append(f"\n## Figure {fig.figure_num} (Page {fig.page_num})\n")
             if fig.saved_path:
-                lines.append(f"*Saved to: {fig.saved_path.name}*\n")
+                lines.append(f"![Figure {fig.figure_num}](./figures/{fig.saved_path.name})\n")
             lines.append(f"*Size: {fig.width}x{fig.height} ({fig.format})*\n")
             lines.append(f"\n{fig.description}\n")
 
@@ -465,7 +465,7 @@ class OCRProcessor:
     def save_result(self, result: OCRResult, output_path: Optional[Path] = None) -> Path:
         if output_path is None:
             base_name = sanitize_filename(result.input_path.stem)
-            output_path = self.output_dir / f"{base_name}.md"
+            output_path = self.output_dir / base_name / f"{base_name}.md"
 
         ensure_dir(output_path.parent)
 
