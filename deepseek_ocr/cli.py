@@ -1,4 +1,4 @@
-"""Command-line interface for DeepSeek OCR via Ollama."""
+"""Command-line interface for DeepSeek OCR."""
 
 import sys
 from pathlib import Path
@@ -12,31 +12,96 @@ from deepseek_ocr import __version__
 from deepseek_ocr.config import settings
 from deepseek_ocr.model import ModelManager
 from deepseek_ocr.processor import OCRProcessor
-from deepseek_ocr.utils import setup_logging
+from deepseek_ocr.utils import collect_files, is_pdf_file, setup_logging
 
 console = Console()
+err_console = Console(stderr=True)
 
 
-def print_banner() -> None:
-    console.print(f"[dim]deepseek-ocr v{__version__}[/dim]")
+def print_banner(quiet: bool = False) -> None:
+    if not quiet:
+        console.print(f"[dim]deepseek-ocr v{__version__}[/dim]")
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format byte count as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} TB"
+
+
+def _get_pdf_page_count(path: Path) -> int:
+    """Get page count from a PDF without rendering."""
+    import fitz
+
+    doc = fitz.open(path)
+    count = len(doc)
+    doc.close()
+    return count
+
+
+def _run_dry_run(input_path: Path, recursive: bool, quiet: bool) -> None:
+    """List files that would be processed without actually processing them."""
+    files = collect_files(input_path, recursive=recursive)
+
+    if quiet:
+        for f in files:
+            console.print(str(f))
+        return
+
+    table = Table(title="Files to process (dry run)", show_header=True, header_style="bold")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("File", style="cyan")
+    table.add_column("Type", style="green")
+    table.add_column("Size", justify="right")
+    table.add_column("Pages", justify="right")
+
+    total_size = 0
+    total_pages = 0
+
+    for idx, f in enumerate(files, 1):
+        size = f.stat().st_size
+        total_size += size
+
+        if is_pdf_file(f):
+            try:
+                pages = _get_pdf_page_count(f)
+            except Exception:
+                pages = 0
+            file_type = "PDF"
+        else:
+            pages = 1
+            file_type = f.suffix.upper().lstrip(".")
+
+        total_pages += pages
+        table.add_row(str(idx), f.name, file_type, _format_size(size), str(pages))
+
+    console.print(table)
+    console.print(
+        f"\n[bold]{len(files)}[/bold] files, "
+        f"[bold]{_format_size(total_size)}[/bold] total, "
+        f"[bold]{total_pages}[/bold] pages"
+    )
 
 
 @click.group()
 @click.version_option(version=__version__)
-@click.option(
-    "--verbose",
-    is_flag=True,
-    help="Enable verbose output",
-)
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool) -> None:
-    """DeepSeek OCR CLI - Local OCR processing via Ollama.
+def cli(ctx: click.Context) -> None:
+    """DeepSeek OCR CLI - OCR processing via Ollama or vLLM.
 
-    Requires Ollama to be running with deepseek-ocr model pulled.
+    Process documents and images directly:
+
+    \b
+        deepseek-ocr document.pdf
+        deepseek-ocr ./papers/ --recursive
+        deepseek-ocr document.pdf --dry-run
+
+    Supports Ollama (local, default) and vLLM (OpenAI-compatible API) backends.
     """
     ctx.ensure_object(dict)
-    ctx.obj["verbose"] = verbose
-    setup_logging(level=settings.log_level, verbose=verbose)
 
 
 @cli.command()
@@ -104,7 +169,23 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     "max_dimension",
     type=int,
     default=None,
-    help="Maximum image dimension (width or height). Larger images are resized to prevent Ollama timeouts. Default: 1920. Set to 0 to disable.",
+    help="Maximum image dimension (width or height). Larger images are resized to prevent timeouts. Default: 1920. Set to 0 to disable.",
+)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="List files that would be processed without running OCR. Shows file count, sizes, and page counts.",
+)
+@click.option(
+    "-q",
+    "--quiet",
+    is_flag=True,
+    help="Suppress non-error output. Only print file paths on success (useful for scripting).",
+)
+@click.option(
+    "--verbose",
+    is_flag=True,
+    help="Enable verbose output",
 )
 @click.pass_context
 def process(
@@ -121,6 +202,9 @@ def process(
     workers: int,
     analyze_figures: bool,
     max_dimension: Optional[int],
+    dry_run: bool,
+    quiet: bool,
+    verbose: bool,
 ) -> None:
     """Process documents and images with OCR.
 
@@ -128,21 +212,26 @@ def process(
 
     Supported formats: PDF, JPG, PNG, WEBP, GIF, BMP, TIFF
 
+    \b
     Examples:
-
-        # Process a single PDF
-        deepseek-ocr process document.pdf
-
-        # Process all files in a directory
-        deepseek-ocr process ./documents/ --recursive
-
-        # Use custom prompt
-        deepseek-ocr process image.jpg --prompt "Extract all text"
-
-        # Extract page images from PDF
-        deepseek-ocr process paper.pdf --extract-images
+        deepseek-ocr document.pdf
+        deepseek-ocr ./documents/ --recursive
+        deepseek-ocr paper.pdf --dry-run
+        deepseek-ocr image.jpg --prompt "Extract all text"
+        deepseek-ocr paper.pdf -q | xargs ls -la
     """
-    print_banner()
+    setup_logging(level=settings.log_level, verbose=verbose)
+
+    if dry_run:
+        print_banner(quiet=quiet)
+        try:
+            _run_dry_run(input_path, recursive=recursive, quiet=quiet)
+        except Exception as e:
+            err_console.print(f"[red]error:[/red] {e}")
+            sys.exit(1)
+        return
+
+    print_banner(quiet=quiet)
 
     try:
         model_manager = ModelManager(model_name=model_name, max_dimension=max_dimension)
@@ -162,35 +251,44 @@ def process(
         processor = OCRProcessor(**processor_kwargs)
 
         if input_path.is_file():
-            result = processor.process_file(input_path, prompt=prompt, show_progress=not ctx.obj["verbose"])
+            result = processor.process_file(input_path, prompt=prompt, show_progress=not verbose and not quiet)
             output_path = processor.save_result(result)
-            console.print(f"→ {output_path}")
+            if quiet:
+                console.print(str(output_path))
+            else:
+                console.print(f"[dim]->[/dim] {output_path}")
         else:
             results = processor.process_batch(
                 input_path,
                 recursive=recursive,
                 prompt=prompt,
-                show_progress=not ctx.obj["verbose"],
+                show_progress=not verbose and not quiet,
             )
 
-            table = Table(show_header=True, header_style="bold")
-            table.add_column("File", style="cyan")
-            table.add_column("Pages", justify="right")
-            table.add_column("Time (s)", justify="right")
+            if quiet:
+                for result in results:
+                    base_name = result.input_path.stem
+                    output_path = processor.output_dir / f"{base_name}.md"
+                    console.print(str(output_path))
+            else:
+                table = Table(show_header=True, header_style="bold")
+                table.add_column("File", style="cyan")
+                table.add_column("Pages", justify="right")
+                table.add_column("Time (s)", justify="right")
 
-            for result in results:
-                table.add_row(
-                    result.input_path.name,
-                    str(result.page_count),
-                    f"{result.processing_time:.2f}",
-                )
+                for result in results:
+                    table.add_row(
+                        result.input_path.name,
+                        str(result.page_count),
+                        f"{result.processing_time:.2f}",
+                    )
 
-            console.print(table)
+                console.print(table)
 
         model_manager.unload_model()
 
     except Exception as e:
-        console.print(f"[red]error:[/red] {e}")
+        err_console.print(f"[red]error:[/red] {e}")
         sys.exit(1)
 
 
@@ -231,13 +329,13 @@ def info() -> None:
     console.print("Documents: PDF\n")
 
     if not ollama_running:
-        console.print("[yellow]⚠ Ollama is not running. Start with: ollama serve[/yellow]\n")
+        console.print("[yellow]Ollama is not running. Start with: ollama serve[/yellow]\n")
     elif not model_available:
-        console.print("[yellow]⚠ Model not found. Pull with: ollama pull deepseek-ocr[/yellow]\n")
+        console.print("[yellow]Model not found. Pull with: ollama pull deepseek-ocr[/yellow]\n")
 
 
 def main() -> None:
-    """Entry point. Supports shorthand `deepseek-ocr INPUT_PATH` by auto-inserting 'process' subcommand."""
+    """Entry point. Auto-inserts 'process' when first arg is a file/directory path."""
     argv = sys.argv[1:]
 
     if argv:
