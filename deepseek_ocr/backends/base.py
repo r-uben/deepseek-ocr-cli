@@ -1,10 +1,23 @@
 """Abstract base class for OCR backends."""
 
+import logging
+import random
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Union
 
 from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+
+class TransientError(Exception):
+    """Wraps a transient error that should be retried."""
+
+    def __init__(self, message: str, original: Exception | None = None):
+        super().__init__(message)
+        self.original = original
 
 
 class Backend(ABC):
@@ -27,9 +40,13 @@ class Backend(ABC):
         self,
         model_name: str,
         max_dimension: int | None = None,
+        max_retries: int = 3,
+        retry_delay: float = 1.0,
     ):
         self.model_name = model_name
         self.max_dimension = max_dimension
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         self.model: bool = False
 
     @property
@@ -68,6 +85,39 @@ class Backend(ABC):
             OCR text result
         """
         ...
+
+    def _retry(self, func, *args, **kwargs):
+        """Execute func with exponential backoff retry on TransientError.
+
+        Args:
+            func: Callable that may raise TransientError for retryable failures.
+
+        Returns:
+            The return value of func.
+
+        Raises:
+            RuntimeError: After max_retries exhausted, or on non-transient errors.
+        """
+        last_error = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                return func(*args, **kwargs)
+            except TransientError as e:
+                last_error = e
+                if attempt < self.max_retries:
+                    delay = self.retry_delay * (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning(
+                        f"[{self.backend_name}] Transient error (attempt {attempt + 1}/"
+                        f"{self.max_retries + 1}): {e}. Retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                else:
+                    logger.error(
+                        f"[{self.backend_name}] Max retries ({self.max_retries}) exhausted: {e}"
+                    )
+        raise RuntimeError(
+            f"Max retries ({self.max_retries}) exhausted: {last_error}"
+        )
 
     def process_images_batch(
         self,

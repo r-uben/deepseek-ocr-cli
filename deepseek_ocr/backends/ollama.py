@@ -9,7 +9,7 @@ from typing import Union
 import requests
 from PIL import Image
 
-from deepseek_ocr.backends.base import Backend
+from deepseek_ocr.backends.base import Backend, TransientError
 from deepseek_ocr.config import settings
 from deepseek_ocr.model import clean_ocr_output
 from deepseek_ocr.utils import resize_image_if_needed
@@ -17,6 +17,9 @@ from deepseek_ocr.utils import resize_image_if_needed
 logger = logging.getLogger(__name__)
 
 OLLAMA_API_URL = "http://localhost:11434"
+
+# HTTP status codes that indicate transient errors worth retrying
+_TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
 class OllamaBackend(Backend):
@@ -27,10 +30,14 @@ class OllamaBackend(Backend):
         model_name: str = "deepseek-ocr",
         ollama_url: str | None = None,
         max_dimension: int | None = None,
+        max_retries: int | None = None,
+        retry_delay: float | None = None,
     ):
         super().__init__(
             model_name=model_name,
             max_dimension=max_dimension if max_dimension is not None else settings.max_dimension,
+            max_retries=max_retries if max_retries is not None else settings.max_retries,
+            retry_delay=retry_delay if retry_delay is not None else settings.retry_delay,
         )
         self.ollama_url = ollama_url or settings.ollama_url or OLLAMA_API_URL
         logger.info(f"Initialized OllamaBackend with model: {self.model_name}")
@@ -88,6 +95,40 @@ class OllamaBackend(Backend):
         image.save(buffer, format="JPEG", quality=95)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
+    def _call_ollama_api(self, image_b64: str, prompt: str) -> str:
+        """Make the Ollama API call, raising TransientError for retryable failures."""
+        try:
+            response = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "images": [image_b64],
+                    "stream": False,
+                    "options": {
+                        "num_ctx": 8192,
+                        "temperature": 0.1,
+                    },
+                },
+                timeout=1800,
+            )
+        except requests.exceptions.Timeout as e:
+            raise TransientError("Ollama request timed out", original=e)
+        except requests.exceptions.ConnectionError as e:
+            raise TransientError(
+                f"Lost connection to Ollama at {self.ollama_url}", original=e
+            )
+
+        if response.status_code in _TRANSIENT_STATUS_CODES:
+            raise TransientError(
+                f"Ollama API returned HTTP {response.status_code}: {response.text}"
+            )
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Ollama API error: {response.text}")
+
+        return response.json().get("response", "")
+
     def process_image(
         self,
         image: Union[Image.Image, Path, str],
@@ -112,39 +153,10 @@ class OllamaBackend(Backend):
 
         logger.debug(f"Processing image with prompt: {prompt}")
 
-        try:
-            image = resize_image_if_needed(image, self.max_dimension)
-            image_b64 = self._image_to_base64(image)
+        image = resize_image_if_needed(image, self.max_dimension)
+        image_b64 = self._image_to_base64(image)
 
-            response = requests.post(
-                f"{self.ollama_url}/api/generate",
-                json={
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "images": [image_b64],
-                    "stream": False,
-                    "options": {
-                        "num_ctx": 8192,
-                        "temperature": 0.1,
-                    },
-                },
-                timeout=1800,
-            )
-
-            if response.status_code != 200:
-                raise RuntimeError(f"Ollama API error: {response.text}")
-
-            result = response.json()
-            raw_text = result.get("response", "")
-            if return_raw:
-                return raw_text
-            return clean_ocr_output(raw_text)
-
-        except requests.exceptions.Timeout:
-            raise RuntimeError("Ollama request timed out (>30 minutes)")
-        except requests.exceptions.ConnectionError:
-            raise RuntimeError(
-                f"Lost connection to Ollama at {self.ollama_url}. " "Is Ollama still running?"
-            )
-        except Exception as e:
-            raise RuntimeError(f"Inference failed: {e}")
+        raw_text = self._retry(self._call_ollama_api, image_b64, prompt)
+        if return_raw:
+            return raw_text
+        return clean_ocr_output(raw_text)

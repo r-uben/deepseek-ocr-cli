@@ -19,6 +19,8 @@ class TestSettings:
         assert settings.output_dir == Path("output")
         assert settings.extract_images is False
         assert settings.include_metadata is True
+        assert settings.max_retries == 3
+        assert settings.retry_delay == 1.0
 
     def test_backend_choices(self) -> None:
         """Test that backend only accepts valid choices."""

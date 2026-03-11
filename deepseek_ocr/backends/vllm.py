@@ -8,7 +8,7 @@ from typing import Union
 
 from PIL import Image
 
-from deepseek_ocr.backends.base import Backend
+from deepseek_ocr.backends.base import Backend, TransientError
 from deepseek_ocr.config import settings
 from deepseek_ocr.model import clean_ocr_output
 from deepseek_ocr.utils import resize_image_if_needed
@@ -26,10 +26,14 @@ class VLLMBackend(Backend):
         model_name: str = "deepseek-vl2",
         base_url: str | None = None,
         max_dimension: int | None = None,
+        max_retries: int | None = None,
+        retry_delay: float | None = None,
     ):
         super().__init__(
             model_name=model_name,
             max_dimension=max_dimension if max_dimension is not None else settings.max_dimension,
+            max_retries=max_retries if max_retries is not None else settings.max_retries,
+            retry_delay=retry_delay if retry_delay is not None else settings.retry_delay,
         )
         self.base_url = base_url or getattr(settings, "vllm_base_url", None) or VLLM_DEFAULT_URL
         self._client = None
@@ -92,6 +96,50 @@ class VLLMBackend(Backend):
         b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{b64}"
 
+    def _call_vllm_api(self, image_url: str, prompt: str) -> str:
+        """Make the vLLM API call, raising TransientError for retryable failures."""
+        import openai
+
+        try:
+            response = self._client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_url},
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                        ],
+                    }
+                ],
+                max_tokens=2048,
+                temperature=0.1,
+            )
+            return response.choices[0].message.content or ""
+
+        except openai.APITimeoutError as e:
+            raise TransientError(f"vLLM request timed out: {e}", original=e)
+        except openai.APIConnectionError as e:
+            raise TransientError(f"Lost connection to vLLM: {e}", original=e)
+        except openai.RateLimitError as e:
+            raise TransientError(f"vLLM rate limit: {e}", original=e)
+        except openai.InternalServerError as e:
+            raise TransientError(f"vLLM server error: {e}", original=e)
+        except openai.APIStatusError as e:
+            # 502, 503, 504 come through as APIStatusError
+            if e.status_code in {502, 503, 504}:
+                raise TransientError(
+                    f"vLLM HTTP {e.status_code}: {e}", original=e
+                )
+            # Non-transient (400, 404, etc.) — don't retry
+            raise RuntimeError(f"vLLM API error (HTTP {e.status_code}): {e}")
+
     def process_image(
         self,
         image: Union[Image.Image, Path, str],
@@ -116,35 +164,10 @@ class VLLMBackend(Backend):
 
         logger.debug(f"Processing image with prompt: {prompt}")
 
-        try:
-            image = resize_image_if_needed(image, self.max_dimension)
-            image_url = self._image_to_base64_url(image)
+        image = resize_image_if_needed(image, self.max_dimension)
+        image_url = self._image_to_base64_url(image)
 
-            response = self._client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": image_url},
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt,
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=2048,  # Leave room for input tokens in context window
-                temperature=0.1,
-            )
-
-            raw_text = response.choices[0].message.content or ""
-            if return_raw:
-                return raw_text
-            return clean_ocr_output(raw_text)
-
-        except Exception as e:
-            raise RuntimeError(f"vLLM inference failed: {e}")
+        raw_text = self._retry(self._call_vllm_api, image_url, prompt)
+        if return_raw:
+            return raw_text
+        return clean_ocr_output(raw_text)

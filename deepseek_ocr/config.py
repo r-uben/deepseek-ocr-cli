@@ -57,6 +57,16 @@ class Settings(BaseSettings):
         description="Include metadata in output markdown",
     )
 
+    # Retry configuration
+    max_retries: int = Field(
+        default=3,
+        description="Maximum number of retries for transient backend errors",
+    )
+    retry_delay: float = Field(
+        default=1.0,
+        description="Base delay in seconds between retries (exponential backoff)",
+    )
+
     # Logging
     log_level: str = Field(
         default="INFO",

@@ -1,16 +1,18 @@
 """Backend implementations for DeepSeek OCR."""
 
-from deepseek_ocr.backends.base import Backend
+from deepseek_ocr.backends.base import Backend, TransientError
 from deepseek_ocr.backends.ollama import OllamaBackend
 from deepseek_ocr.backends.vllm import VLLMBackend
 
-__all__ = ["Backend", "OllamaBackend", "VLLMBackend", "create_backend"]
+__all__ = ["Backend", "TransientError", "OllamaBackend", "VLLMBackend", "create_backend"]
 
 
 def create_backend(
     backend_type: str = "ollama",
     model_name: str = "deepseek-ocr",
     max_dimension: int | None = None,
+    max_retries: int | None = None,
+    retry_delay: float | None = None,
     **kwargs,
 ) -> Backend:
     """Factory function to create the appropriate backend.
@@ -19,6 +21,8 @@ def create_backend(
         backend_type: "ollama" or "vllm"
         model_name: Model name/identifier
         max_dimension: Maximum image dimension for resizing
+        max_retries: Maximum number of retries for transient errors
+        retry_delay: Base delay in seconds between retries
         **kwargs: Additional backend-specific arguments
 
     Returns:
@@ -30,12 +34,16 @@ def create_backend(
         return OllamaBackend(
             model_name=model_name,
             max_dimension=max_dimension,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
             ollama_url=kwargs.get("ollama_url"),
         )
     elif backend_type == "vllm":
         return VLLMBackend(
             model_name=model_name,
             max_dimension=max_dimension,
+            max_retries=max_retries,
+            retry_delay=retry_delay,
             base_url=kwargs.get("vllm_base_url"),
         )
     else:
