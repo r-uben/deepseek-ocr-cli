@@ -1,15 +1,14 @@
 #!/usr/bin/env python
-"""Batch processing example for DeepSeek OCR CLI library (Ollama backend)."""
+"""Batch processing example for DeepSeek OCR CLI library."""
 
 from pathlib import Path
-from deepseek_ocr import ModelManager, OCRProcessor
+from deepseek_ocr import create_backend, OCRProcessor
 
 
 def main() -> None:
     """Demonstrate batch processing of multiple files."""
     print("DeepSeek OCR - Batch Processing Example\n")
 
-    # Set up paths
     input_dir = Path("./documents")
     output_dir = Path("./output_batch")
 
@@ -18,18 +17,18 @@ def main() -> None:
         print("Please create ./documents/ and add some PDF/image files")
         return
 
-    # Initialize model
+    # Initialize backend
     print("1. Connecting to Ollama...")
-    model_manager = ModelManager(model_name="deepseek-ocr")
-    model_manager.load_model()
+    backend = create_backend(backend_type="ollama", model_name="deepseek-ocr")
+    backend.load_model()
     print("   Connected\n")
 
     # Create processor
     print("2. Setting up processor...")
     processor = OCRProcessor(
-        model_manager=model_manager,
+        backend=backend,
         output_dir=output_dir,
-        extract_images=True,  # Extract images from PDFs
+        extract_images=True,
         include_metadata=True,
     )
 
@@ -37,7 +36,7 @@ def main() -> None:
     print(f"3. Processing files in: {input_dir}")
     results = processor.process_batch(
         input_path=input_dir,
-        recursive=True,  # Search subdirectories
+        recursive=True,
         show_progress=True,
     )
 
@@ -53,10 +52,8 @@ def main() -> None:
             print(f"   Average time per page: {total_time/total_pages:.2f}s")
     print(f"   Output directory: {output_dir}\n")
 
-    # Cleanup
-    print("5. Cleaning up...")
-    model_manager.unload_model()
-    print("   Done!\n")
+    backend.unload_model()
+    print("Done!")
 
 
 if __name__ == "__main__":

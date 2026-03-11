@@ -11,8 +11,7 @@ from PIL import Image
 
 from deepseek_ocr.backends.base import Backend, TransientError
 from deepseek_ocr.config import settings
-from deepseek_ocr.model import clean_ocr_output
-from deepseek_ocr.utils import resize_image_if_needed
+from deepseek_ocr.utils import clean_ocr_output, resize_image_if_needed
 
 logger = logging.getLogger(__name__)
 

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -24,7 +24,6 @@ from deepseek_ocr.utils import (
 
 if TYPE_CHECKING:
     from deepseek_ocr.backends.base import Backend
-    from deepseek_ocr.model import ModelManager
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +86,6 @@ class OCRProcessor:
     def __init__(
         self,
         backend: Optional["Backend"] = None,
-        model_manager: Optional["ModelManager"] = None,  # Deprecated, for backward compat
         output_dir: Optional[Path] = None,
         extract_images: bool = False,
         include_metadata: bool = True,
@@ -95,11 +93,8 @@ class OCRProcessor:
         workers: int = 1,
         analyze_figures: bool = False,
     ):
-        # Accept either backend or model_manager for backward compatibility
         if backend is not None:
             self._backend = backend
-        elif model_manager is not None:
-            self._backend = model_manager
         else:
             from deepseek_ocr.backends import create_backend
 
@@ -114,11 +109,6 @@ class OCRProcessor:
 
         ensure_dir(self.output_dir)
         logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}, workers: {self.workers}")
-
-    @property
-    def model_manager(self) -> Union["Backend", "ModelManager"]:
-        """Backward-compatible property."""
-        return self._backend
 
     def _pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
         logger.debug(f"Converting PDF to images: {pdf_path} at {self.dpi} DPI")

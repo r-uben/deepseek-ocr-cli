@@ -1,6 +1,7 @@
 """Utility functions for DeepSeek OCR CLI."""
 
 import logging
+import re
 from pathlib import Path
 from typing import List
 
@@ -122,3 +123,65 @@ def sanitize_filename(filename: str) -> str:
 def ensure_dir(directory: Path) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def _html_table_to_markdown(html_table: str) -> str:
+    rows = []
+    row_matches = re.findall(r'<tr[^>]*>(.*?)</tr>', html_table, re.DOTALL | re.IGNORECASE)
+
+    for row_html in row_matches:
+        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row_html, re.DOTALL | re.IGNORECASE)
+        cleaned_cells = []
+        for cell in cells:
+            cell = re.sub(r'<[^>]+>', '', cell)
+            cell = ' '.join(cell.split())
+            cleaned_cells.append(cell)
+        if cleaned_cells:
+            rows.append(cleaned_cells)
+
+    if not rows:
+        return ""
+
+    md_lines = []
+    for idx, row in enumerate(rows):
+        md_lines.append("| " + " | ".join(row) + " |")
+        if idx == 0:
+            md_lines.append("|" + "|".join(["---"] * len(row)) + "|")
+
+    return "\n".join(md_lines)
+
+
+def clean_ocr_output(text: str) -> str:
+    """Remove grounding annotations, convert HTML tables to markdown, decode entities."""
+    text = re.sub(r'<\|ref\|>.*?<\|/ref\|>', '', text)
+    text = re.sub(r'<\|det\|>\[\[.*?\]\]<\|/det\|>', '', text)
+    text = re.sub(r'<\|[^|]+\|>', '', text)
+
+    def replace_table(match: re.Match) -> str:
+        return _html_table_to_markdown(match.group(0))
+
+    text = re.sub(r'<table[^>]*>.*?</table>', replace_table, text, flags=re.DOTALL | re.IGNORECASE)
+
+    text = re.sub(r'<(sup|sub)>([^<]*)</\1>', r'^\2', text, flags=re.IGNORECASE)
+    text = re.sub(r'<center>([^<]*)</center>', r'\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+
+    html_entities = {
+        '&amp;': '&',
+        '&lt;': '<',
+        '&gt;': '>',
+        '&quot;': '"',
+        '&apos;': "'",
+        '&nbsp;': ' ',
+        '&#39;': "'",
+        '&#x27;': "'",
+    }
+    for entity, char in html_entities.items():
+        text = text.replace(entity, char)
+
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    lines = [line.strip() for line in text.split('\n')]
+    text = '\n'.join(lines)
+    text = text.strip()
+    return text
