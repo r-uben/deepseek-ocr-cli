@@ -156,6 +156,9 @@ def clean_ocr_output(text: str) -> str:
     text = re.sub(r'<\|ref\|>.*?<\|/ref\|>', '', text)
     text = re.sub(r'<\|det\|>\[\[.*?\]\]<\|/det\|>', '', text)
     text = re.sub(r'<\|[^|]+\|>', '', text)
+    # Strip bare bounding box coordinates that leak through without tags
+    # e.g., "text[[114, 531, 883, 619]]" → "text"
+    text = re.sub(r'\[\[\d+,\s*\d+,\s*\d+,\s*\d+\]\]', '', text)
 
     def replace_table(match: re.Match) -> str:
         return _html_table_to_markdown(match.group(0))
