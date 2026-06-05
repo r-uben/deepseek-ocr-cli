@@ -310,9 +310,7 @@ def info() -> None:
 
     ollama_backend = OllamaBackend()
     ollama_running = ollama_backend._check_ollama_running()
-    ollama_model_available = (
-        ollama_backend._check_model_available() if ollama_running else False
-    )
+    ollama_model_available = ollama_backend._check_model_available() if ollama_running else False
 
     sys_table.add_row("Ollama URL", settings.ollama_url)
     sys_table.add_row("Ollama Running", "Yes" if ollama_running else "No")
@@ -363,11 +361,7 @@ def main() -> None:
             candidate = argv[first_non_option_index]
 
             if candidate not in known_subcommands and Path(candidate).exists():
-                argv = (
-                    argv[:first_non_option_index]
-                    + ["process"]
-                    + argv[first_non_option_index:]
-                )
+                argv = argv[:first_non_option_index] + ["process"] + argv[first_non_option_index:]
                 sys.argv = [sys.argv[0], *argv]
 
     cli(obj={})

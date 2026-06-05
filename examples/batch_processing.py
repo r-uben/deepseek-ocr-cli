@@ -49,7 +49,7 @@ def main() -> None:
         print(f"   Total pages: {total_pages}")
         print(f"   Total time: {total_time:.2f}s")
         if total_pages > 0:
-            print(f"   Average time per page: {total_time/total_pages:.2f}s")
+            print(f"   Average time per page: {total_time / total_pages:.2f}s")
     print(f"   Output directory: {output_dir}\n")
 
     backend.unload_model()

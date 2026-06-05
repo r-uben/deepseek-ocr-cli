@@ -235,9 +235,7 @@ def _extract_figures_from_pdf(pdf_path: Path) -> list[FigureInfo]:
     return figures
 
 
-def _process_figures(
-    doc: Path, doc_dir: Path, backend: Backend
-) -> str:
+def _process_figures(doc: Path, doc_dir: Path, backend: Backend) -> str:
     """Extract, save, and describe embedded figures; return their markdown block.
 
     Figures land under ``<doc_dir>/figures/figure_<N>_page<P>.png`` (canon naming)
@@ -302,9 +300,7 @@ def _build_doc_metadata(
     error = None
     if status is not Status.COMPLETED:
         if result.page_errors:
-            error = "; ".join(
-                f"page {n}: {msg}" for n, msg in sorted(result.page_errors.items())
-            )
+            error = "; ".join(f"page {n}: {msg}" for n, msg in sorted(result.page_errors.items()))
         elif result.error:
             error = result.error
     return DocMetadata(
@@ -398,7 +394,11 @@ def process(
 
         result, _images = _ocr_one_document(doc, backend, task, prompt, dpi)
 
-        if analyze_figures and result.status is not Status.FAILED and doc.suffix.lower() in _DOC_SUFFIXES:
+        if (
+            analyze_figures
+            and result.status is not Status.FAILED
+            and doc.suffix.lower() in _DOC_SUFFIXES
+        ):
             doc_dir = doc_dir_for(output_root, rel_key)
             doc_dir.mkdir(parents=True, exist_ok=True)
             result.figures_markdown = _process_figures(doc, doc_dir, backend)

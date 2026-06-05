@@ -114,9 +114,7 @@ class OllamaBackend(Backend):
         except requests.exceptions.Timeout as e:
             raise TransientError("Ollama request timed out", original=e)
         except requests.exceptions.ConnectionError as e:
-            raise TransientError(
-                f"Lost connection to Ollama at {self.ollama_url}", original=e
-            )
+            raise TransientError(f"Lost connection to Ollama at {self.ollama_url}", original=e)
 
         if response.status_code in _TRANSIENT_STATUS_CODES:
             raise TransientError(

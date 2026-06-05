@@ -52,8 +52,7 @@ class VLLMBackend(Backend):
             import openai
         except ImportError:
             raise RuntimeError(
-                "openai package is required for vLLM backend. "
-                "Install with: pip install openai"
+                "openai package is required for vLLM backend. Install with: pip install openai"
             )
 
         logger.info(f"Connecting to vLLM at {self.base_url}")
@@ -76,8 +75,7 @@ class VLLMBackend(Backend):
                 )
         except Exception as e:
             raise RuntimeError(
-                f"Failed to connect to vLLM at {self.base_url}: {e}. "
-                "Is the vLLM server running?"
+                f"Failed to connect to vLLM at {self.base_url}: {e}. Is the vLLM server running?"
             )
 
         self.model = True
@@ -133,9 +131,7 @@ class VLLMBackend(Backend):
         except openai.APIStatusError as e:
             # 502, 503, 504 come through as APIStatusError
             if e.status_code in {502, 503, 504}:
-                raise TransientError(
-                    f"vLLM HTTP {e.status_code}: {e}", original=e
-                )
+                raise TransientError(f"vLLM HTTP {e.status_code}: {e}", original=e)
             # Non-transient (400, 404, etc.) — don't retry
             raise RuntimeError(f"vLLM API error (HTTP {e.status_code}): {e}")
 
