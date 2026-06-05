@@ -1,25 +1,50 @@
-"""Document processing and batch handling for DeepSeek OCR."""
+"""Render inputs to page images, OCR each via a backend, write canonical Markdown.
 
+deepseek is a *local, page-based* engine: it renders a PDF (or reads a directory of
+page images) to per-page images and OCRs each page through one of its backends
+(ollama / vllm). This module owns *how OCR happens* and deepseek's figure extraction;
+the shared ``ocr-output-contract`` package owns *where the bytes go* and what shape
+the metadata takes.
+
+The per-page text list this module produces is fed straight into the contract's
+:func:`assemble_pages`, so every page of a document lands in ONE
+``<root>/<rel/dir>/<stem>/<stem>.md`` under ``## Page N`` headers. An empty/whitespace
+page response is a per-page FAILURE recorded in the sidecar, never a silent 0-byte
+success reported as ok. The Markdown body carries NO YAML frontmatter — all provenance
+lives in the per-document ``metadata.json`` sidecar (canon: single source of truth).
+"""
+
+from __future__ import annotations
+
+import hashlib
 import io
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import fitz  # PyMuPDF
+from ocr_output_contract import (
+    DocMetadata,
+    RootIndex,
+    RunOutcome,
+    Status,
+    assemble_pages,
+    doc_dir_for,
+    markdown_path_for,
+    relative_key,
+    resolve_output_root,
+    sha256_checksum,
+    utc_timestamp,
+    write_doc_metadata,
+)
 from PIL import Image
-from tqdm import tqdm
 
-from deepseek_ocr.config import settings
-from deepseek_ocr.metadata import MetadataManager
 from deepseek_ocr.utils import (
-    collect_files,
+    IMAGE_EXTENSIONS,
     ensure_dir,
-    is_pdf_file,
     load_image,
-    sanitize_filename,
 )
 
 if TYPE_CHECKING:
@@ -27,10 +52,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_IMAGE_SUFFIXES = {ext.lower() for ext in IMAGE_EXTENSIONS}
+#: Inputs deepseek treats as a single source document to render page-by-page.
+_DOC_SUFFIXES = {".pdf"}
+
 
 @dataclass
 class FigureInfo:
-    """Container for extracted figure information."""
+    """Container for an extracted embedded figure (opt-in via --analyze-figures)."""
 
     page_num: int
     figure_num: int
@@ -40,463 +69,366 @@ class FigureInfo:
     format: str
     context: str = ""
     description: str = ""
-    saved_path: Optional[Path] = None
+    saved_path: Path | None = None
 
 
-class OCRResult:
-    """Container for OCR processing results."""
+@dataclass
+class DocResult:
+    """Result of OCR'ing one source document (a PDF or an image directory).
 
-    def __init__(
-        self,
-        input_path: Path,
-        output_text: str,
-        page_count: int = 1,
-        processing_time: float = 0.0,
-        metadata: Optional[Dict] = None,
-    ):
-        self.input_path = input_path
-        self.output_text = output_text
-        self.page_count = page_count
-        self.processing_time = processing_time
-        self.metadata = metadata or {}
-        self.timestamp = datetime.now()
+    ``pages`` holds the per-page markdown in order; ``page_errors`` maps a
+    1-indexed page number to its error string for any page that failed (or whose
+    model response was empty). ``status`` maps to the contract enum.
+    """
 
-    def to_markdown(self, include_metadata: bool = True) -> str:
-        lines = []
+    source: Path
+    pages: list[str]
+    processing_time: float = 0.0
+    page_errors: dict[int, str] = field(default_factory=dict)
+    error: str | None = None
+    figures_markdown: str = ""
 
-        if include_metadata:
-            lines.append("---")
-            lines.append(f"source: {self.input_path}")
-            lines.append(f"processed: {self.timestamp.isoformat()}")
-            lines.append(f"pages: {self.page_count}")
-            lines.append(f"processing_time: {self.processing_time:.2f}s")
-            for key, value in self.metadata.items():
-                lines.append(f"{key}: {value}")
-            lines.append("---")
-            lines.append("")
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
 
-        lines.append(self.output_text)
-
-        return "\n".join(lines)
+    @property
+    def status(self) -> Status:
+        """``completed`` = every page ok; ``partial`` = some ok; ``failed`` = none."""
+        if self.pages and not self.page_errors and not self.error:
+            return Status.COMPLETED
+        succeeded = self.page_count - len(self.page_errors)
+        if succeeded > 0:
+            return Status.PARTIAL
+        return Status.FAILED
 
 
-class OCRProcessor:
-    """Handles OCR processing for documents and images."""
+# ---------------------------------------------------------------------------
+# Page OCR (image -> page-text; deepseek-owned). Output shape is the contract's job.
+# ---------------------------------------------------------------------------
 
-    def __init__(
-        self,
-        backend: Optional["Backend"] = None,
-        output_dir: Optional[Path] = None,
-        extract_images: bool = False,
-        include_metadata: bool = True,
-        dpi: int = 200,
-        workers: int = 1,
-        analyze_figures: bool = False,
-    ):
-        if backend is not None:
-            self._backend = backend
-        else:
-            from deepseek_ocr.backends import create_backend
 
-            self._backend = create_backend()
+def _render_pdf(pdf_path: Path, dpi: int) -> list[Image.Image]:
+    """Render each PDF page to an in-memory RGB PIL image."""
+    images: list[Image.Image] = []
+    zoom = dpi / 72
+    mat = fitz.Matrix(zoom, zoom)
+    with fitz.open(pdf_path) as doc:
+        for page_num in range(len(doc)):
+            pix = doc[page_num].get_pixmap(matrix=mat)
+            images.append(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+    return images
 
-        self.output_dir = output_dir or settings.output_dir
-        self.extract_images = extract_images or settings.extract_images
-        self.include_metadata = include_metadata and settings.include_metadata
-        self.dpi = dpi
-        self.workers = max(1, workers)
-        self.analyze_figures = analyze_figures
 
-        ensure_dir(self.output_dir)
-        logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}, workers: {self.workers}")
+def _gather_images(directory: Path) -> list[Path]:
+    images = sorted(p for p in directory.iterdir() if p.suffix.lower() in _IMAGE_SUFFIXES)
+    if not images:
+        raise ValueError(f"no page images found in {directory}")
+    return images
 
-    def _pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
-        logger.debug(f"Converting PDF to images: {pdf_path} at {self.dpi} DPI")
 
+def _ocr_pages(
+    source: Path,
+    images: list[Image.Image],
+    backend: Backend,
+    task: str,
+    prompt: str | None,
+    start: float,
+) -> DocResult:
+    """OCR an ordered list of page images into a DocResult.
+
+    Each page is an independent backend call so page boundaries and per-page
+    failures are real. A page that errors OR returns empty/whitespace text is
+    recorded in ``page_errors`` (empty != success) and gets an explicit failure
+    marker in its slot, keeping the page count and ``## Page N`` numbering aligned.
+    """
+    pages: list[str] = []
+    page_errors: dict[int, str] = {}
+    for idx, image in enumerate(images, start=1):
         try:
-            images = []
-            pdf_document = fitz.open(pdf_path)
+            text = backend.process_image(image, prompt=prompt, task=task)
+            if not text.strip():
+                raise ValueError("empty OCR response (no text returned)")
+            pages.append(text)
+        except Exception as exc:
+            logger.error("OCR failed for page %d of %s: %s", idx, source.name, exc)
+            page_errors[idx] = str(exc)
+            pages.append(f"*[OCR failed for page {idx}]*")
+    return DocResult(
+        source=source,
+        pages=pages,
+        processing_time=time.time() - start,
+        page_errors=page_errors,
+    )
 
-            for page_num in range(len(pdf_document)):
-                page = pdf_document[page_num]
 
-                zoom = self.dpi / 72
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat)
+def _ocr_one_document(
+    doc: Path,
+    backend: Backend,
+    task: str,
+    prompt: str | None,
+    dpi: int,
+) -> tuple[DocResult, list[Image.Image] | None]:
+    """OCR one document. Returns the result plus rendered images (for figure reuse)."""
+    start = time.time()
+    try:
+        if doc.is_dir():
+            image_paths = _gather_images(doc)
+            images = [load_image(p) for p in image_paths]
+            return _ocr_pages(doc, images, backend, task, prompt, start), None
+        if doc.suffix.lower() in _DOC_SUFFIXES:
+            images = _render_pdf(doc, dpi)
+            return _ocr_pages(doc, images, backend, task, prompt, start), images
+        if doc.suffix.lower() in _IMAGE_SUFFIXES:
+            images = [load_image(doc)]
+            return _ocr_pages(doc, images, backend, task, prompt, start), None
+        raise ValueError(f"unsupported input: {doc} (expected a .pdf, image, or directory)")
+    except Exception as exc:
+        logger.error("could not process %s: %s", doc, exc)
+        return (
+            DocResult(source=doc, pages=[], processing_time=time.time() - start, error=str(exc)),
+            None,
+        )
 
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(img)
 
-                logger.debug(f"Converted page {page_num + 1}/{len(pdf_document)}")
+# ---------------------------------------------------------------------------
+# Figure extraction (deepseek-owned, opt-in). Written under the contract doc dir.
+# ---------------------------------------------------------------------------
 
-            pdf_document.close()
-            logger.info(f"Converted {len(images)} pages from {pdf_path.name}")
 
-            return images
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to convert PDF {pdf_path}: {e}")
-
-    def _save_images(self, images: List[Image.Image], base_name: str) -> Path:
-        images_dir = self.output_dir / base_name / "images"
-        ensure_dir(images_dir)
-
-        for idx, image in enumerate(images, 1):
-            image_path = images_dir / f"page_{idx:04d}.png"
-            image.save(image_path, "PNG")
-            logger.debug(f"Saved image: {image_path}")
-
-        logger.info(f"Saved {len(images)} images to {images_dir}")
-        return images_dir
-
-    def _extract_figures_from_pdf(self, pdf_path: Path) -> List[FigureInfo]:
-        """Extract embedded figures/images from a PDF."""
-        figures: List[FigureInfo] = []
-
-        try:
-            doc = fitz.open(pdf_path)
-
+def _extract_figures_from_pdf(pdf_path: Path) -> list[FigureInfo]:
+    """Extract embedded figures/images from a PDF."""
+    figures: list[FigureInfo] = []
+    try:
+        with fitz.open(pdf_path) as doc:
             for page_num in range(len(doc)):
                 page = doc[page_num]
                 page_text = page.get_text()
-                images = page.get_images(full=True)
-
-                for img_idx, img_info in enumerate(images):
+                for img_idx, img_info in enumerate(page.get_images(full=True)):
                     xref = img_info[0]
-
                     try:
                         base_image = doc.extract_image(xref)
-                        image_bytes = base_image["image"]
-
-                        pil_image = Image.open(io.BytesIO(image_bytes))
+                        pil_image = Image.open(io.BytesIO(base_image["image"]))
                         if pil_image.mode != "RGB":
                             pil_image = pil_image.convert("RGB")
-
-                        context = ""
-                        img_rects = page.get_image_rects(xref)
-                        if img_rects:
-                            rect = img_rects[0]
-                            expanded_rect = fitz.Rect(
-                                max(0, rect.x0 - 50),
-                                max(0, rect.y0 - 150),
-                                rect.x1 + 50,
-                                rect.y1 + 150
+                        context = page_text[:500].strip() if page_text else ""
+                        figures.append(
+                            FigureInfo(
+                                page_num=page_num + 1,
+                                figure_num=img_idx + 1,
+                                image=pil_image,
+                                width=base_image["width"],
+                                height=base_image["height"],
+                                format=base_image["ext"],
+                                context=context,
                             )
-                            context = page.get_text("text", clip=expanded_rect).strip()
-
-                        if not context:
-                            context = page_text[:500].strip() if page_text else ""
-
-                        figure = FigureInfo(
-                            page_num=page_num + 1,
-                            figure_num=img_idx + 1,
-                            image=pil_image,
-                            width=base_image["width"],
-                            height=base_image["height"],
-                            format=base_image["ext"],
-                            context=context,
                         )
-                        figures.append(figure)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to extract image %d on page %d: %s",
+                            img_idx + 1,
+                            page_num + 1,
+                            exc,
+                        )
+    except Exception as exc:
+        logger.error("Failed to extract figures from %s: %s", pdf_path, exc)
+    return figures
 
-                    except Exception as e:
-                        logger.warning(f"Failed to extract image {img_idx + 1} from page {page_num + 1}: {e}")
-                        continue
 
-            doc.close()
-            logger.info(f"Extracted {len(figures)} figures from {pdf_path.name}")
+def _process_figures(
+    doc: Path, doc_dir: Path, backend: Backend
+) -> str:
+    """Extract, save, and describe embedded figures; return their markdown block.
 
-        except Exception as e:
-            logger.error(f"Failed to extract figures from {pdf_path}: {e}")
-
-        return figures
-
-    def _save_figures(self, figures: List[FigureInfo], base_name: str) -> Path:
-        """Save extracted figures to disk."""
-        figures_dir = self.output_dir / base_name / "figures"
-        ensure_dir(figures_dir)
-
-        for fig in figures:
-            filename = f"page{fig.page_num}_fig{fig.figure_num}.{fig.format}"
-            fig_path = figures_dir / filename
-            fig.image.save(fig_path)
-            fig.saved_path = fig_path
-            logger.debug(f"Saved figure: {fig_path}")
-
-        logger.info(f"Saved {len(figures)} figures to {figures_dir}")
-        return figures_dir
-
-    def _analyze_single_figure(
-        self, figure: FigureInfo
-    ) -> Tuple[int, int, str, Optional[str]]:
-        """Analyze a single figure. Returns (page_num, fig_num, description, error)."""
+    Figures land under ``<doc_dir>/figures/figure_<N>_page<P>.png`` (canon naming)
+    with resolvable links in the returned markdown.
+    """
+    figures = _extract_figures_from_pdf(doc)
+    if not figures:
+        return ""
+    figures_dir = ensure_dir(doc_dir / "figures")
+    lines = ["\n\n---\n\n# Figures\n"]
+    for fig in figures:
+        filename = f"figure_{fig.figure_num}_page{fig.page_num}.png"
+        fig_path = figures_dir / filename
+        fig.image.save(fig_path, "PNG")
+        fig.saved_path = fig_path
         try:
-            if figure.context:
-                prompt = (
-                    f"This figure appears in a document with the following context:\n"
-                    f"---\n{figure.context[:500]}\n---\n\n"
-                    f"Describe what this figure shows. Include details about any charts, "
-                    f"graphs, diagrams, or visual elements. Explain what it represents "
-                    f"in the context of the document."
-                )
-            else:
-                prompt = (
-                    "Describe this figure in detail. Include information about any charts, "
-                    "graphs, diagrams, tables, or visual elements. Explain what it represents."
-                )
+            fig.description = backend.describe_figure(fig.image)
+        except Exception as exc:
+            logger.error("figure description failed (page %d): %s", fig.page_num, exc)
+            fig.description = f"[Analysis Error: {exc}]"
+        lines.append(f"\n## Figure {fig.figure_num} (Page {fig.page_num})\n")
+        lines.append(f"![Figure {fig.figure_num}](./figures/{filename})\n")
+        lines.append(f"*Size: {fig.width}x{fig.height} ({fig.format})*\n")
+        lines.append(f"\n{fig.description}\n")
+    return "\n".join(lines)
 
-            description = self._backend.process_image(figure.image, prompt=prompt)
-            return (figure.page_num, figure.figure_num, description, None)
 
-        except Exception as e:
-            logger.error(f"Failed to analyze figure {figure.figure_num} on page {figure.page_num}: {e}")
-            return (figure.page_num, figure.figure_num, "", str(e))
+# ---------------------------------------------------------------------------
+# Output writing (all routed through the ocr-output-contract package)
+# ---------------------------------------------------------------------------
 
-    def _analyze_figures(
-        self, figures: List[FigureInfo], show_progress: bool = True
-    ) -> List[FigureInfo]:
-        """Analyze all figures and populate their descriptions."""
-        if not figures:
-            return figures
 
-        if self.workers == 1:
-            fig_iterator = (
-                tqdm(figures, desc="Analyzing figures", unit="fig")
-                if show_progress and len(figures) > 1
-                else figures
+def _backend_model(backend: Backend) -> str:
+    return getattr(backend, "model_name", "") or ""
+
+
+def _backend_name(backend: Backend) -> str:
+    return getattr(backend, "backend_name", "") or ""
+
+
+def _doc_checksum(source: Path) -> str:
+    """Content checksum for idempotency. Hash a PDF/image's bytes, or an image dir's."""
+    if source.is_file():
+        return sha256_checksum(source)
+    h = hashlib.sha256()
+    for img in _gather_images(source):
+        h.update(img.name.encode("utf-8"))
+        with open(img, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+    return f"sha256:{h.hexdigest()}"
+
+
+def _build_doc_metadata(
+    result: DocResult,
+    markdown_path: Path,
+    output_root: Path,
+    backend: Backend,
+) -> DocMetadata:
+    """Assemble the per-document metadata record from a DocResult."""
+    status = result.status
+    error = None
+    if status is not Status.COMPLETED:
+        if result.page_errors:
+            error = "; ".join(
+                f"page {n}: {msg}" for n, msg in sorted(result.page_errors.items())
             )
-            for fig in fig_iterator:
-                _, _, description, error = self._analyze_single_figure(fig)
-                fig.description = description if not error else f"[Analysis Error: {error}]"
-        else:
-            with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                futures = {
-                    executor.submit(self._analyze_single_figure, fig): fig
-                    for fig in figures
-                }
+        elif result.error:
+            error = result.error
+    return DocMetadata(
+        status=status,
+        checksum=_doc_checksum(result.source),
+        model=_backend_model(backend),
+        backend=_backend_name(backend),
+        processing_time=result.processing_time,
+        timestamp=utc_timestamp(),
+        output_path=str(markdown_path.relative_to(output_root)),
+        pages=result.page_count,
+        error=error,
+    )
 
-                if show_progress and len(figures) > 1:
-                    pbar = tqdm(total=len(figures), desc=f"Analyzing figures ({self.workers}w)", unit="fig")
-                else:
-                    pbar = None
 
-                for future in as_completed(futures):
-                    fig = futures[future]
-                    _, _, description, error = future.result()
-                    fig.description = description if not error else f"[Analysis Error: {error}]"
-                    if pbar:
-                        pbar.update(1)
+def _write_document(
+    result: DocResult,
+    output_root: Path,
+    rel_key: str,
+    backend: Backend,
+    index: RootIndex,
+) -> tuple[DocMetadata, Path]:
+    """Write the aggregated markdown + BOTH metadata levels for one document.
 
-                if pbar:
-                    pbar.close()
+    Output is always written (even on failure) so failures are recorded with
+    ``status=failed`` per the canon. The single ``<stem>/<stem>.md`` aggregates
+    every page under ``## Page N`` headers. NO YAML frontmatter — provenance is in
+    the sidecar only.
+    """
+    doc_dir = doc_dir_for(output_root, rel_key)
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = markdown_path_for(doc_dir, rel_key)
 
-        return figures
+    body = assemble_pages(result.pages) if result.pages else "*[OCR Failed]*\n"
+    body += result.figures_markdown
+    markdown_path.write_text(body, encoding="utf-8")
 
-    def _figures_to_markdown(self, figures: List[FigureInfo]) -> str:
-        """Convert figure analyses to markdown."""
-        if not figures:
-            return ""
+    meta = _build_doc_metadata(result, markdown_path, output_root, backend)
+    write_doc_metadata(doc_dir, rel_key, meta)
+    index.record(rel_key, meta)
+    return meta, markdown_path
 
-        lines = ["\n\n---\n\n# Figures\n"]
 
-        for fig in figures:
-            lines.append(f"\n## Figure {fig.figure_num} (Page {fig.page_num})\n")
-            if fig.saved_path:
-                lines.append(f"![Figure {fig.figure_num}](./figures/{fig.saved_path.name})\n")
-            lines.append(f"*Size: {fig.width}x{fig.height} ({fig.format})*\n")
-            lines.append(f"\n{fig.description}\n")
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 
-        return "\n".join(lines)
 
-    def _process_single_page(
-        self, page_data: Tuple[int, Image.Image], prompt: Optional[str] = None
-    ) -> Tuple[int, str, Optional[str]]:
-        """Process a single page image. Returns (page_num, text, error)."""
-        page_num, image = page_data
-        try:
-            output = self._backend.process_image(image, prompt=prompt)
-            return (page_num, output, None)
-        except Exception as e:
-            logger.error(f"Failed to process page {page_num}: {e}")
-            return (page_num, "", str(e))
+def process(
+    source: Path,
+    backend: Backend,
+    dpi: int = 200,
+    task: str = "convert",
+    prompt: str | None = None,
+    output_dir: Path | None = None,
+    reprocess: bool = False,
+    analyze_figures: bool = False,
+) -> RunOutcome:
+    """Process an input (file or directory of documents) through the contract.
 
-    def process_file(
-        self, file_path: Path, prompt: Optional[str] = None, show_progress: bool = True
-    ) -> OCRResult:
-        """Process a single file (image or PDF)."""
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+    ``source`` is either a single document (a ``.pdf``, an image, or a directory of
+    page images treated as ONE document) or a batch directory tree of such documents.
+    Output goes to ``resolve_output_root(source, output_dir)`` — default
+    ``<input-parent>/ocr/``; ``-o`` overrides; never required.
 
-        logger.info(f"Processing file: {file_path}")
-        start_time = datetime.now()
+    Returns a :class:`RunOutcome` whose ``exit_code`` is nonzero if any
+    document/page failed (uniform across single-file and batch).
+    """
+    documents = _discover_documents(source)
+    if not documents:
+        raise ValueError(f"no documents found at {source}")
 
-        if self._backend.model is None:
-            self._backend.load_model()
+    if backend.model is None or backend.model is False:
+        backend.load_model()
 
-        try:
-            if is_pdf_file(file_path):
-                images = self._pdf_to_images(file_path)
-                page_count = len(images)
+    output_root = resolve_output_root(source, output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    # A single image-dir document keys on its own folder name (no file stem);
+    # a batch tree keys each input document input-relative to the tree root.
+    single_image_dir = len(documents) == 1 and documents[0] == source and source.is_dir()
+    scan_root = source.parent if (source.is_file() or single_image_dir) else source
+    index = RootIndex(output_root)
 
-                if self.extract_images:
-                    base_name = sanitize_filename(file_path.stem)
-                    self._save_images(images, base_name)
+    outcome = RunOutcome()
+    for doc in documents:
+        rel_key = relative_key(doc, scan_root)
+        if not reprocess and index.is_completed(rel_key, _doc_checksum(doc)):
+            logger.info("skip %s (already completed; use --reprocess)", rel_key)
+            outcome.add(Status.COMPLETED)
+            continue
 
-                page_data = [(idx, img) for idx, img in enumerate(images, 1)]
+        result, _images = _ocr_one_document(doc, backend, task, prompt, dpi)
 
-                if self.workers == 1:
-                    outputs = []
-                    page_iterator = (
-                        tqdm(page_data, total=page_count, desc="OCR pages", unit="page")
-                        if show_progress and page_count > 1
-                        else page_data
-                    )
-                    for idx, image in page_iterator:
-                        logger.debug(f"Processing page {idx}/{page_count}")
-                        output = self._backend.process_image(image, prompt=prompt)
-                        outputs.append(f"## Page {idx}\n\n{output}")
-                else:
-                    results_dict: Dict[int, str] = {}
-                    errors: List[str] = []
+        if analyze_figures and result.status is not Status.FAILED and doc.suffix.lower() in _DOC_SUFFIXES:
+            doc_dir = doc_dir_for(output_root, rel_key)
+            doc_dir.mkdir(parents=True, exist_ok=True)
+            result.figures_markdown = _process_figures(doc, doc_dir, backend)
 
-                    with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                        futures = {
-                            executor.submit(self._process_single_page, pd, prompt): pd[0]
-                            for pd in page_data
-                        }
+        meta, markdown_path = _write_document(result, output_root, rel_key, backend, index)
+        outcome.add(
+            meta.status,
+            detail=None if meta.status is Status.COMPLETED else rel_key,
+            output_path=str(markdown_path),
+        )
 
-                        if show_progress and page_count > 1:
-                            pbar = tqdm(total=page_count, desc=f"OCR pages ({self.workers}w)", unit="page")
-                        else:
-                            pbar = None
+    return outcome
 
-                        for future in as_completed(futures):
-                            page_num, text, error = future.result()
-                            if error:
-                                errors.append(f"Page {page_num}: {error}")
-                                results_dict[page_num] = f"[OCR Error: {error}]"
-                            else:
-                                results_dict[page_num] = text
-                            if pbar:
-                                pbar.update(1)
 
-                        if pbar:
-                            pbar.close()
+def _discover_documents(source: Path) -> list[Path]:
+    """Return the list of source documents under ``source``.
 
-                    if errors:
-                        logger.warning(f"Errors on {len(errors)} pages: {errors}")
-
-                    outputs = [
-                        f"## Page {i}\n\n{results_dict[i]}"
-                        for i in sorted(results_dict.keys())
-                    ]
-
-                output_text = "\n\n".join(outputs)
-
-                if self.analyze_figures:
-                    figures = self._extract_figures_from_pdf(file_path)
-                    if figures:
-                        base_name = sanitize_filename(file_path.stem)
-                        self._save_figures(figures, base_name)
-                        self._analyze_figures(figures, show_progress=show_progress)
-                        output_text += self._figures_to_markdown(figures)
-
-            else:
-                image = load_image(file_path)
-                output_text = self._backend.process_image(image, prompt=prompt)
-                page_count = 1
-
-            processing_time = (datetime.now() - start_time).total_seconds()
-
-            metadata = {
-                "model": self._backend.model_name,
-                "backend": getattr(self._backend, "backend_name", "ollama"),
-            }
-
-            result = OCRResult(
-                input_path=file_path,
-                output_text=output_text,
-                page_count=page_count,
-                processing_time=processing_time,
-                metadata=metadata,
-            )
-
-            logger.info(
-                f"Processed {file_path.name} - {page_count} pages in {processing_time:.2f}s"
-            )
-
-            return result
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to process {file_path}: {e}")
-
-    def process_batch(
-        self,
-        input_path: Path,
-        recursive: bool = False,
-        prompt: Optional[str] = None,
-        show_progress: bool = True,
-        reprocess: bool = False,
-    ) -> List[OCRResult]:
-        """Process multiple files from a directory.
-
-        Args:
-            reprocess: If True, reprocess files even if already in metadata.
-        """
-        files = collect_files(input_path, recursive=recursive)
-        logger.info(f"Found {len(files)} files to process")
-
-        metadata = MetadataManager(self.output_dir)
-
-        # Filter already-processed files unless reprocess is requested
-        if not reprocess:
-            to_process = []
-            skipped = 0
-            for f in files:
-                if metadata.is_processed(f):
-                    skipped += 1
-                else:
-                    to_process.append(f)
-            if skipped:
-                logger.info(f"Skipping {skipped} already-processed files")
-            files = to_process
-
-        if self._backend.model is None:
-            self._backend.load_model()
-
-        results = []
-        iterator = tqdm(files, desc="Processing files") if show_progress else files
-
-        for file_path in iterator:
-            try:
-                result = self.process_file(file_path, prompt=prompt)
-                results.append(result)
-                output_path = self.save_result(result)
-
-                metadata.record(
-                    file_path,
-                    pages=result.page_count,
-                    processing_time=result.processing_time,
-                    model=result.metadata.get("model", ""),
-                    backend=result.metadata.get("backend", ""),
-                    output_path=str(output_path.relative_to(self.output_dir)),
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to process {file_path}: {e}")
-                continue
-
-        logger.info(f"Successfully processed {len(results)}/{len(files)} files")
-        return results
-
-    def save_result(self, result: OCRResult, output_path: Optional[Path] = None) -> Path:
-        if output_path is None:
-            base_name = sanitize_filename(result.input_path.stem)
-            output_path = self.output_dir / base_name / f"{base_name}.md"
-
-        ensure_dir(output_path.parent)
-
-        markdown_content = result.to_markdown(include_metadata=self.include_metadata)
-        output_path.write_text(markdown_content, encoding="utf-8")
-
-        logger.info(f"Saved result to: {output_path}")
-        return output_path
+    A bare ``.pdf`` or image is one document. A directory is treated as a SINGLE
+    image-dir document when it directly contains page images (socr renders a PDF to
+    PNGs and passes the dir); otherwise it is a batch tree and every ``.pdf``/image
+    under it (recursively) is one document.
+    """
+    if source.is_file():
+        return [source]
+    if source.is_dir():
+        has_direct_images = any(
+            p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES for p in source.iterdir()
+        )
+        if has_direct_images:
+            return [source]
+        supported = _DOC_SUFFIXES | _IMAGE_SUFFIXES
+        return sorted(p for p in source.rglob("*") if p.suffix.lower() in supported)
+    return []
