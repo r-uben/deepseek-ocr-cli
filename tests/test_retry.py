@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from deepseek_ocr.backends.base import Backend, TransientError
+from deepseek_ocr.backends.base import TransientError
 from deepseek_ocr.backends.ollama import OllamaBackend
 
 
@@ -33,6 +33,7 @@ class TestRetryLogic:
         backend.max_dimension = None
         backend.max_retries = max_retries
         backend.retry_delay = retry_delay
+        backend.max_tokens = 8192
         backend.model = True
         backend.ollama_url = "http://localhost:11434"
         return backend
@@ -118,6 +119,7 @@ class TestOllamaRetry:
         backend.max_dimension = None
         backend.max_retries = 2
         backend.retry_delay = 0.0
+        backend.max_tokens = 8192
         backend.model = True
         backend.ollama_url = "http://localhost:11434"
         return backend

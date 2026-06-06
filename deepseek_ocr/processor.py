@@ -1,25 +1,59 @@
-"""Document processing and batch handling for DeepSeek OCR."""
+"""Render inputs to page images, OCR each via a backend, write canonical Markdown.
 
+deepseek is a *local, page-based* engine: it renders a PDF (or reads a directory of
+page images) to per-page images and OCRs each page through one of its backends
+(ollama / vllm). This module owns *how OCR happens* and deepseek's figure extraction;
+the shared ``ocr-output-contract`` package owns *where the bytes go* and what shape
+the metadata takes.
+
+The per-page text list this module produces is fed straight into the contract's
+:func:`assemble_pages`, so every page of a document lands in ONE
+``<root>/<rel/dir>/<stem>/<stem>.md`` under ``## Page N`` headers. An empty/whitespace
+page response is a per-page FAILURE recorded in the sidecar, never a silent 0-byte
+success reported as ok. The Markdown body carries NO YAML frontmatter — all provenance
+lives in the per-document ``metadata.json`` sidecar (canon: single source of truth).
+"""
+
+from __future__ import annotations
+
+import hashlib
 import io
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import fitz  # PyMuPDF
+from ocr_output_contract import (
+    UNREADABLE_CHECKSUM,
+    DocMetadata,
+    RootIndex,
+    RunOutcome,
+    Status,
+    assemble_pages,
+    doc_dir_for,
+    figure_filename,
+    figure_markdown_link,
+    figures_dir_for,
+    is_truncated,
+    is_within_output_root,
+    iter_input_files,
+    markdown_path_for,
+    relative_key,
+    resolve_output_root,
+    run_fingerprint,
+    safe_checksum,
+    sha256_checksum,
+    utc_timestamp,
+    write_doc_metadata,
+)
 from PIL import Image
-from tqdm import tqdm
 
-from deepseek_ocr.config import settings
-from deepseek_ocr.metadata import MetadataManager
 from deepseek_ocr.utils import (
-    collect_files,
+    IMAGE_EXTENSIONS,
     ensure_dir,
-    is_pdf_file,
     load_image,
-    sanitize_filename,
 )
 
 if TYPE_CHECKING:
@@ -27,10 +61,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_IMAGE_SUFFIXES = {ext.lower() for ext in IMAGE_EXTENSIONS}
+#: Inputs deepseek treats as a single source document to render page-by-page.
+_DOC_SUFFIXES = {".pdf"}
+
 
 @dataclass
 class FigureInfo:
-    """Container for extracted figure information."""
+    """Container for an extracted embedded figure (opt-in via --analyze-figures)."""
 
     page_num: int
     figure_num: int
@@ -40,463 +78,531 @@ class FigureInfo:
     format: str
     context: str = ""
     description: str = ""
-    saved_path: Optional[Path] = None
+    saved_path: Path | None = None
 
 
-class OCRResult:
-    """Container for OCR processing results."""
+@dataclass
+class DocResult:
+    """Result of OCR'ing one source document (a PDF or an image directory).
 
-    def __init__(
-        self,
-        input_path: Path,
-        output_text: str,
-        page_count: int = 1,
-        processing_time: float = 0.0,
-        metadata: Optional[Dict] = None,
-    ):
-        self.input_path = input_path
-        self.output_text = output_text
-        self.page_count = page_count
-        self.processing_time = processing_time
-        self.metadata = metadata or {}
-        self.timestamp = datetime.now()
+    ``pages`` holds the per-page markdown in order; ``page_errors`` maps a
+    1-indexed page number to its error string for any page that failed (or whose
+    model response was empty). ``status`` maps to the contract enum.
+    """
 
-    def to_markdown(self, include_metadata: bool = True) -> str:
-        lines = []
+    source: Path
+    pages: list[str]
+    processing_time: float = 0.0
+    page_errors: dict[int, str] = field(default_factory=dict)
+    error: str | None = None
+    figures_markdown: str = ""
 
-        if include_metadata:
-            lines.append("---")
-            lines.append(f"source: {self.input_path}")
-            lines.append(f"processed: {self.timestamp.isoformat()}")
-            lines.append(f"pages: {self.page_count}")
-            lines.append(f"processing_time: {self.processing_time:.2f}s")
-            for key, value in self.metadata.items():
-                lines.append(f"{key}: {value}")
-            lines.append("---")
-            lines.append("")
+    @property
+    def page_count(self) -> int:
+        return len(self.pages)
 
-        lines.append(self.output_text)
-
-        return "\n".join(lines)
+    @property
+    def status(self) -> Status:
+        """``completed`` = every page ok; ``partial`` = some ok; ``failed`` = none."""
+        if self.pages and not self.page_errors and not self.error:
+            return Status.COMPLETED
+        succeeded = self.page_count - len(self.page_errors)
+        if succeeded > 0:
+            return Status.PARTIAL
+        return Status.FAILED
 
 
-class OCRProcessor:
-    """Handles OCR processing for documents and images."""
+# ---------------------------------------------------------------------------
+# Page OCR (image -> page-text; deepseek-owned). Output shape is the contract's job.
+# ---------------------------------------------------------------------------
 
-    def __init__(
-        self,
-        backend: Optional["Backend"] = None,
-        output_dir: Optional[Path] = None,
-        extract_images: bool = False,
-        include_metadata: bool = True,
-        dpi: int = 200,
-        workers: int = 1,
-        analyze_figures: bool = False,
-    ):
-        if backend is not None:
-            self._backend = backend
-        else:
-            from deepseek_ocr.backends import create_backend
 
-            self._backend = create_backend()
+def _render_pdf(pdf_path: Path, dpi: int) -> list[Image.Image]:
+    """Render each PDF page to an in-memory RGB PIL image."""
+    images: list[Image.Image] = []
+    zoom = dpi / 72
+    mat = fitz.Matrix(zoom, zoom)
+    with fitz.open(pdf_path) as doc:
+        for page_num in range(len(doc)):
+            pix = doc[page_num].get_pixmap(matrix=mat)
+            images.append(Image.frombytes("RGB", [pix.width, pix.height], pix.samples))
+    return images
 
-        self.output_dir = output_dir or settings.output_dir
-        self.extract_images = extract_images or settings.extract_images
-        self.include_metadata = include_metadata and settings.include_metadata
-        self.dpi = dpi
-        self.workers = max(1, workers)
-        self.analyze_figures = analyze_figures
 
-        ensure_dir(self.output_dir)
-        logger.info(f"OCRProcessor initialized with output_dir: {self.output_dir}, workers: {self.workers}")
+def _gather_images(directory: Path) -> list[Path]:
+    images = sorted(p for p in directory.iterdir() if p.suffix.lower() in _IMAGE_SUFFIXES)
+    if not images:
+        raise ValueError(f"no page images found in {directory}")
+    return images
 
-    def _pdf_to_images(self, pdf_path: Path) -> List[Image.Image]:
-        logger.debug(f"Converting PDF to images: {pdf_path} at {self.dpi} DPI")
 
+def _ocr_pages(
+    source: Path,
+    images: list[Image.Image],
+    backend: Backend,
+    task: str,
+    prompt: str | None,
+    start: float,
+    raw: bool = False,
+) -> DocResult:
+    """OCR an ordered list of page images into a DocResult.
+
+    Each page is an independent backend call so page boundaries and per-page
+    failures are real. A page that errors OR returns empty/whitespace text is
+    recorded in ``page_errors`` (empty != success) and gets an explicit failure
+    marker in its slot, keeping the page count and ``## Page N`` numbering aligned.
+
+    Truncation is a per-page failure too: when the backend reports it stopped on
+    a length/token limit (``finish_reason`` in the contract's
+    :data:`TRUNCATION_FINISH_REASONS`), the page text is non-empty but
+    incomplete, so recording it as ``completed`` would be silent content loss.
+    Such a page is recorded in ``page_errors`` (driving status=partial/failed)
+    while keeping the recovered-so-far text in its slot rather than discarding it.
+
+    ``raw`` opts out of the backend's ``clean_ocr_output`` post-processing so the
+    model's verbatim output (including ``[[d,d,d,d]]`` boxes and ``<...>`` spans)
+    is preserved for faithful extraction.
+    """
+    pages: list[str] = []
+    page_errors: dict[int, str] = {}
+    for idx, image in enumerate(images, start=1):
         try:
-            images = []
-            pdf_document = fitz.open(pdf_path)
+            text, finish_reason = _ocr_one_image(backend, image, prompt, task, raw)
+            if not text.strip():
+                raise ValueError("empty OCR response (no text returned)")
+            # Per-page truncation: 1 image -> 1 page, so the page-shortfall signal
+            # does not apply; the finish_reason length-limit signal does. Keep the
+            # recovered-so-far text but flag the page so it is not a silent success.
+            if is_truncated(finish_reason, parsed_pages=1, actual_pages=1):
+                page_errors[idx] = (
+                    f"truncated response (finish_reason={finish_reason!r}); "
+                    "page content is incomplete"
+                )
+            pages.append(text)
+        except Exception as exc:
+            logger.error("OCR failed for page %d of %s: %s", idx, source.name, exc)
+            page_errors[idx] = str(exc)
+            pages.append(f"*[OCR failed for page {idx}]*")
+    return DocResult(
+        source=source,
+        pages=pages,
+        processing_time=time.time() - start,
+        page_errors=page_errors,
+    )
 
-            for page_num in range(len(pdf_document)):
-                page = pdf_document[page_num]
 
-                zoom = self.dpi / 72
-                mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat)
+def _ocr_one_image(
+    backend: Backend,
+    image: Image.Image,
+    prompt: str | None,
+    task: str,
+    raw: bool = False,
+) -> tuple[str, object | None]:
+    """Call the backend, returning ``(text, finish_reason)``.
 
-                img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                images.append(img)
+    Backends that surface a completion ``finish_reason`` override
+    :meth:`Backend.process_image_with_meta`; the default falls back to
+    :meth:`Backend.process_image` with ``finish_reason=None`` (no truncation
+    signal), keeping the contract intact for engines/mocks that do not report it.
+    """
+    return backend.process_image_with_meta(image, prompt=prompt, task=task, return_raw=raw)
 
-                logger.debug(f"Converted page {page_num + 1}/{len(pdf_document)}")
 
-            pdf_document.close()
-            logger.info(f"Converted {len(images)} pages from {pdf_path.name}")
+def _ocr_one_document(
+    doc: Path,
+    backend: Backend,
+    task: str,
+    prompt: str | None,
+    dpi: int,
+    raw: bool = False,
+) -> tuple[DocResult, list[Image.Image] | None]:
+    """OCR one document. Returns the result plus rendered images (for figure reuse)."""
+    start = time.time()
+    try:
+        if doc.is_dir():
+            image_paths = _gather_images(doc)
+            images = [load_image(p) for p in image_paths]
+            return _ocr_pages(doc, images, backend, task, prompt, start, raw), None
+        if doc.suffix.lower() in _DOC_SUFFIXES:
+            images = _render_pdf(doc, dpi)
+            return _ocr_pages(doc, images, backend, task, prompt, start, raw), images
+        if doc.suffix.lower() in _IMAGE_SUFFIXES:
+            images = [load_image(doc)]
+            return _ocr_pages(doc, images, backend, task, prompt, start, raw), None
+        raise ValueError(f"unsupported input: {doc} (expected a .pdf, image, or directory)")
+    except Exception as exc:
+        logger.error("could not process %s: %s", doc, exc)
+        return (
+            DocResult(source=doc, pages=[], processing_time=time.time() - start, error=str(exc)),
+            None,
+        )
 
-            return images
 
-        except Exception as e:
-            raise RuntimeError(f"Failed to convert PDF {pdf_path}: {e}")
+# ---------------------------------------------------------------------------
+# Figure extraction (deepseek-owned, opt-in). Written under the contract doc dir.
+# ---------------------------------------------------------------------------
 
-    def _save_images(self, images: List[Image.Image], base_name: str) -> Path:
-        images_dir = self.output_dir / base_name / "images"
-        ensure_dir(images_dir)
 
-        for idx, image in enumerate(images, 1):
-            image_path = images_dir / f"page_{idx:04d}.png"
-            image.save(image_path, "PNG")
-            logger.debug(f"Saved image: {image_path}")
-
-        logger.info(f"Saved {len(images)} images to {images_dir}")
-        return images_dir
-
-    def _extract_figures_from_pdf(self, pdf_path: Path) -> List[FigureInfo]:
-        """Extract embedded figures/images from a PDF."""
-        figures: List[FigureInfo] = []
-
-        try:
-            doc = fitz.open(pdf_path)
-
+def _extract_figures_from_pdf(pdf_path: Path) -> list[FigureInfo]:
+    """Extract embedded figures/images from a PDF."""
+    figures: list[FigureInfo] = []
+    try:
+        with fitz.open(pdf_path) as doc:
             for page_num in range(len(doc)):
                 page = doc[page_num]
                 page_text = page.get_text()
-                images = page.get_images(full=True)
-
-                for img_idx, img_info in enumerate(images):
+                for img_idx, img_info in enumerate(page.get_images(full=True)):
                     xref = img_info[0]
-
                     try:
                         base_image = doc.extract_image(xref)
-                        image_bytes = base_image["image"]
-
-                        pil_image = Image.open(io.BytesIO(image_bytes))
+                        pil_image = Image.open(io.BytesIO(base_image["image"]))
                         if pil_image.mode != "RGB":
                             pil_image = pil_image.convert("RGB")
-
-                        context = ""
-                        img_rects = page.get_image_rects(xref)
-                        if img_rects:
-                            rect = img_rects[0]
-                            expanded_rect = fitz.Rect(
-                                max(0, rect.x0 - 50),
-                                max(0, rect.y0 - 150),
-                                rect.x1 + 50,
-                                rect.y1 + 150
+                        context = page_text[:500].strip() if page_text else ""
+                        figures.append(
+                            FigureInfo(
+                                page_num=page_num + 1,
+                                figure_num=img_idx + 1,
+                                image=pil_image,
+                                width=base_image["width"],
+                                height=base_image["height"],
+                                format=base_image["ext"],
+                                context=context,
                             )
-                            context = page.get_text("text", clip=expanded_rect).strip()
-
-                        if not context:
-                            context = page_text[:500].strip() if page_text else ""
-
-                        figure = FigureInfo(
-                            page_num=page_num + 1,
-                            figure_num=img_idx + 1,
-                            image=pil_image,
-                            width=base_image["width"],
-                            height=base_image["height"],
-                            format=base_image["ext"],
-                            context=context,
                         )
-                        figures.append(figure)
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to extract image %d on page %d: %s",
+                            img_idx + 1,
+                            page_num + 1,
+                            exc,
+                        )
+    except Exception as exc:
+        logger.error("Failed to extract figures from %s: %s", pdf_path, exc)
+    return figures
 
-                    except Exception as e:
-                        logger.warning(f"Failed to extract image {img_idx + 1} from page {page_num + 1}: {e}")
-                        continue
 
-            doc.close()
-            logger.info(f"Extracted {len(figures)} figures from {pdf_path.name}")
+def _process_figures(doc: Path, doc_dir: Path, backend: Backend) -> str:
+    """Extract, save, and describe embedded figures; return their markdown block.
 
-        except Exception as e:
-            logger.error(f"Failed to extract figures from {pdf_path}: {e}")
-
-        return figures
-
-    def _save_figures(self, figures: List[FigureInfo], base_name: str) -> Path:
-        """Save extracted figures to disk."""
-        figures_dir = self.output_dir / base_name / "figures"
-        ensure_dir(figures_dir)
-
-        for fig in figures:
-            filename = f"page{fig.page_num}_fig{fig.figure_num}.{fig.format}"
-            fig_path = figures_dir / filename
-            fig.image.save(fig_path)
-            fig.saved_path = fig_path
-            logger.debug(f"Saved figure: {fig_path}")
-
-        logger.info(f"Saved {len(figures)} figures to {figures_dir}")
-        return figures_dir
-
-    def _analyze_single_figure(
-        self, figure: FigureInfo
-    ) -> Tuple[int, int, str, Optional[str]]:
-        """Analyze a single figure. Returns (page_num, fig_num, description, error)."""
+    Figures land under ``<doc_dir>/figures/figure_<N>_page<P>.png`` (canon naming)
+    with resolvable links in the returned markdown.
+    """
+    figures = _extract_figures_from_pdf(doc)
+    if not figures:
+        return ""
+    figures_dir = ensure_dir(figures_dir_for(doc_dir))
+    lines = ["\n\n---\n\n# Figures\n"]
+    for fig in figures:
+        filename = figure_filename(fig.figure_num, fig.page_num)
+        fig_path = figures_dir / filename
+        fig.image.save(fig_path, "PNG")
+        fig.saved_path = fig_path
         try:
-            if figure.context:
-                prompt = (
-                    f"This figure appears in a document with the following context:\n"
-                    f"---\n{figure.context[:500]}\n---\n\n"
-                    f"Describe what this figure shows. Include details about any charts, "
-                    f"graphs, diagrams, or visual elements. Explain what it represents "
-                    f"in the context of the document."
-                )
-            else:
-                prompt = (
-                    "Describe this figure in detail. Include information about any charts, "
-                    "graphs, diagrams, tables, or visual elements. Explain what it represents."
-                )
+            fig.description = backend.describe_figure(fig.image)
+        except Exception as exc:
+            logger.error("figure description failed (page %d): %s", fig.page_num, exc)
+            fig.description = f"[Analysis Error: {exc}]"
+        lines.append(f"\n## Figure {fig.figure_num} (Page {fig.page_num})\n")
+        lines.append(figure_markdown_link(fig.figure_num, fig.page_num) + "\n")
+        lines.append(f"*Size: {fig.width}x{fig.height} ({fig.format})*\n")
+        lines.append(f"\n{fig.description}\n")
+    return "\n".join(lines)
 
-            description = self._backend.process_image(figure.image, prompt=prompt)
-            return (figure.page_num, figure.figure_num, description, None)
 
-        except Exception as e:
-            logger.error(f"Failed to analyze figure {figure.figure_num} on page {figure.page_num}: {e}")
-            return (figure.page_num, figure.figure_num, "", str(e))
+# ---------------------------------------------------------------------------
+# Output writing (all routed through the ocr-output-contract package)
+# ---------------------------------------------------------------------------
 
-    def _analyze_figures(
-        self, figures: List[FigureInfo], show_progress: bool = True
-    ) -> List[FigureInfo]:
-        """Analyze all figures and populate their descriptions."""
-        if not figures:
-            return figures
 
-        if self.workers == 1:
-            fig_iterator = (
-                tqdm(figures, desc="Analyzing figures", unit="fig")
-                if show_progress and len(figures) > 1
-                else figures
+def _backend_model(backend: Backend) -> str:
+    return getattr(backend, "model_name", "") or ""
+
+
+def _backend_name(backend: Backend) -> str:
+    return getattr(backend, "backend_name", "") or ""
+
+
+def _doc_checksum(source: Path) -> str:
+    """Content checksum for idempotency. Hash a PDF/image's bytes, or an image dir's."""
+    if source.is_file():
+        return sha256_checksum(source)
+    h = hashlib.sha256()
+    for img in _gather_images(source):
+        h.update(img.name.encode("utf-8"))
+        with open(img, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+    return f"sha256:{h.hexdigest()}"
+
+
+def _safe_doc_checksum(source: Path) -> str | None:
+    """Like :func:`_doc_checksum`, but ``None`` instead of raising on an OSError.
+
+    Mirrors the contract's :func:`safe_checksum` for deepseek's two input shapes:
+    a single file (delegating to ``safe_checksum``) and an image directory (which
+    may still raise if an image is deleted/unreadable between discovery and
+    processing). A ``None`` result means "input unreadable now" — the idempotency
+    pre-check must NOT skip (it processes, and the per-doc catch-all in
+    :func:`_ocr_one_document` records that one doc ``status=failed`` and the batch
+    CONTINUES, rather than an ``OSError`` aborting the whole run — the SYS-02
+    "one bad file aborts the batch" failure mode).
+    """
+    if source.is_file():
+        # safe_checksum already returns None on OSError for the single-file case.
+        return safe_checksum(source)
+    try:
+        return _doc_checksum(source)
+    except OSError:
+        return None
+
+
+def _build_doc_metadata(
+    result: DocResult,
+    markdown_path: Path,
+    output_root: Path,
+    backend: Backend,
+    fingerprint: str | None,
+) -> DocMetadata:
+    """Assemble the per-document metadata record from a DocResult."""
+    status = result.status
+    error = None
+    if status is not Status.COMPLETED:
+        if result.page_errors:
+            error = "; ".join(f"page {n}: {msg}" for n, msg in sorted(result.page_errors.items()))
+        elif result.error:
+            error = result.error
+    # Tolerant checksum: if the source became unreadable mid-run we still persist a
+    # status=failed record rather than letting the failure-metadata write itself throw
+    # and escape the per-doc error boundary. Fall back to the canonical ``sha256:``
+    # UNREADABLE_CHECKSUM sentinel (v0.1.3) instead of "" — the conformance harness
+    # requires a ``sha256:`` checksum even on a failure record. The sentinel can never
+    # equal a real digest, so a later readable run gets a different checksum and
+    # reprocesses. (failure_checksum's generalization to deepseek's two input shapes:
+    # _safe_doc_checksum handles both the single-file and image-directory cases.)
+    checksum = _safe_doc_checksum(result.source) or UNREADABLE_CHECKSUM
+    return DocMetadata(
+        status=status,
+        checksum=checksum,
+        model=_backend_model(backend),
+        backend=_backend_name(backend),
+        processing_time=result.processing_time,
+        timestamp=utc_timestamp(),
+        output_path=str(markdown_path.relative_to(output_root)),
+        pages=result.page_count,
+        error=error,
+        fingerprint=fingerprint,
+    )
+
+
+def _write_document(
+    result: DocResult,
+    output_root: Path,
+    rel_key: str,
+    backend: Backend,
+    index: RootIndex,
+    fingerprint: str | None,
+) -> tuple[DocMetadata, Path]:
+    """Write the aggregated markdown + BOTH metadata levels for one document.
+
+    Output is always written (even on failure) so failures are recorded with
+    ``status=failed`` per the canon. The single ``<stem>/<stem>.md`` aggregates
+    every page under ``## Page N`` headers. NO YAML frontmatter — provenance is in
+    the sidecar only.
+    """
+    doc_dir = doc_dir_for(output_root, rel_key)
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    markdown_path = markdown_path_for(doc_dir, rel_key)
+
+    body = assemble_pages(result.pages) if result.pages else "*[OCR Failed]*\n"
+    body += result.figures_markdown
+    markdown_path.write_text(body, encoding="utf-8")
+
+    meta = _build_doc_metadata(result, markdown_path, output_root, backend, fingerprint)
+    write_doc_metadata(doc_dir, rel_key, meta)
+    index.record(rel_key, meta)
+    return meta, markdown_path
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
+def process(
+    source: Path,
+    backend: Backend,
+    dpi: int = 200,
+    task: str = "convert",
+    prompt: str | None = None,
+    output_dir: Path | None = None,
+    reprocess: bool = False,
+    analyze_figures: bool = False,
+    raw: bool = False,
+) -> RunOutcome:
+    """Process an input (file or directory of documents) through the contract.
+
+    ``source`` is either a single document (a ``.pdf``, an image, or a directory of
+    page images treated as ONE document) or a batch directory tree of such documents.
+    Output goes to ``resolve_output_root(source, output_dir)`` — default
+    ``<input-parent>/ocr/``; ``-o`` overrides; never required.
+
+    ``raw`` opts out of ``clean_ocr_output`` so the model's verbatim text is kept.
+
+    Returns a :class:`RunOutcome` whose ``exit_code`` is nonzero if any
+    document/page failed (uniform across single-file and batch).
+    """
+    # Resolve the output root FIRST so discovery can exclude it. The canonical
+    # default for a directory input is ``<input>/ocr/`` — INSIDE the scanned tree —
+    # so a naive recursive walk would re-ingest the engine's own .md/figure outputs
+    # as inputs on the next run. The contract's iter_input_files prunes that subtree.
+    output_root = resolve_output_root(source, output_dir)
+
+    documents, scan_root = _discover_documents(source, output_root)
+    if not documents:
+        raise ValueError(f"no documents found at {source}")
+
+    if backend.model is None or backend.model is False:
+        backend.load_model()
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    index = RootIndex(output_root)
+    # Run fingerprint keys the idempotency cache on everything that changes a
+    # document's OUTPUT for a given input. The dedicated task/prompt params handle
+    # the prompt selector; ``extra`` carries the remaining RESOLVED output-affecting
+    # flags (raw, dpi, max_tokens, analyze_figures) so a re-run with any of them
+    # changed reprocesses instead of silently reusing a stale cached result.
+    #
+    # When a custom --prompt is set the backends IGNORE --task (they only call
+    # get_prompt(task) when prompt is None), so task is dropped from the fingerprint
+    # to avoid needlessly reprocessing two same-prompt runs that differ only in task.
+    fingerprint = run_fingerprint(
+        model=_backend_model(backend),
+        backend=_backend_name(backend),
+        task=None if prompt is not None else task,
+        prompt=prompt,
+        extra={
+            "raw": raw,
+            "dpi": dpi,
+            "max_tokens": getattr(backend, "max_tokens", None),
+            "analyze_figures": analyze_figures,
+        },
+    )
+
+    outcome = RunOutcome()
+    for doc in documents:
+        rel_key = relative_key(doc, scan_root)
+        # Idempotency pre-check uses the SAFE checksum: an input that became
+        # unreadable between discovery and processing yields None, which can never
+        # match a recorded checksum, so the doc is NOT skipped — it falls through to
+        # _ocr_one_document, whose catch-all records it status=failed and the batch
+        # CONTINUES (no whole-run abort: the SYS-02 class the contract guards).
+        pre_checksum = _safe_doc_checksum(doc)
+        if (
+            not reprocess
+            and pre_checksum is not None
+            and index.is_completed(rel_key, pre_checksum, fingerprint=fingerprint)
+        ):
+            logger.info("skip %s (already completed; use --reprocess)", rel_key)
+            # Quiet mode emits one .md path per processed doc; a cached/resumed doc
+            # is still "present", so emit its path too (compute + verify on disk).
+            skip_md = markdown_path_for(doc_dir_for(output_root, rel_key), rel_key)
+            outcome.add(
+                Status.COMPLETED,
+                output_path=str(skip_md) if skip_md.exists() else None,
             )
-            for fig in fig_iterator:
-                _, _, description, error = self._analyze_single_figure(fig)
-                fig.description = description if not error else f"[Analysis Error: {error}]"
-        else:
-            with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                futures = {
-                    executor.submit(self._analyze_single_figure, fig): fig
-                    for fig in figures
-                }
+            continue
 
-                if show_progress and len(figures) > 1:
-                    pbar = tqdm(total=len(figures), desc=f"Analyzing figures ({self.workers}w)", unit="fig")
-                else:
-                    pbar = None
+        result, _images = _ocr_one_document(doc, backend, task, prompt, dpi, raw)
 
-                for future in as_completed(futures):
-                    fig = futures[future]
-                    _, _, description, error = future.result()
-                    fig.description = description if not error else f"[Analysis Error: {error}]"
-                    if pbar:
-                        pbar.update(1)
+        if (
+            analyze_figures
+            and result.status is not Status.FAILED
+            and doc.suffix.lower() in _DOC_SUFFIXES
+        ):
+            doc_dir = doc_dir_for(output_root, rel_key)
+            doc_dir.mkdir(parents=True, exist_ok=True)
+            result.figures_markdown = _process_figures(doc, doc_dir, backend)
 
-                if pbar:
-                    pbar.close()
+        meta, markdown_path = _write_document(
+            result, output_root, rel_key, backend, index, fingerprint
+        )
+        outcome.add(
+            meta.status,
+            detail=None if meta.status is Status.COMPLETED else rel_key,
+            output_path=str(markdown_path),
+        )
 
-        return figures
+    return outcome
 
-    def _figures_to_markdown(self, figures: List[FigureInfo]) -> str:
-        """Convert figure analyses to markdown."""
-        if not figures:
-            return ""
 
-        lines = ["\n\n---\n\n# Figures\n"]
+def discover_documents(source: Path, output_dir: Path | None = None) -> list[Path]:
+    """Public preview of what :func:`process` would OCR, in the SAME order.
 
-        for fig in figures:
-            lines.append(f"\n## Figure {fig.figure_num} (Page {fig.page_num})\n")
-            if fig.saved_path:
-                lines.append(f"![Figure {fig.figure_num}](./figures/{fig.saved_path.name})\n")
-            lines.append(f"*Size: {fig.width}x{fig.height} ({fig.format})*\n")
-            lines.append(f"\n{fig.description}\n")
+    Resolves the output root exactly as the real run does and returns the list of
+    source documents discovered under ``source`` (with the output-root subtree
+    excluded). The CLI ``--dry-run`` uses this so the preview never diverges from
+    the real run (the dry-run/real-run divergence the review flagged).
+    """
+    output_root = resolve_output_root(source, output_dir)
+    documents, _scan_root = _discover_documents(source, output_root)
+    return documents
 
-        return "\n".join(lines)
 
-    def _process_single_page(
-        self, page_data: Tuple[int, Image.Image], prompt: Optional[str] = None
-    ) -> Tuple[int, str, Optional[str]]:
-        """Process a single page image. Returns (page_num, text, error)."""
-        page_num, image = page_data
-        try:
-            output = self._backend.process_image(image, prompt=prompt)
-            return (page_num, output, None)
-        except Exception as e:
-            logger.error(f"Failed to process page {page_num}: {e}")
-            return (page_num, "", str(e))
+def _is_image_dir_document(source: Path, output_root: Path) -> bool:
+    """True when ``source`` is unambiguously ONE document made of page images.
 
-    def process_file(
-        self, file_path: Path, prompt: Optional[str] = None, show_progress: bool = True
-    ) -> OCRResult:
-        """Process a single file (image or PDF)."""
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
+    socr renders a PDF to ``page_0001.png ...`` and passes the directory, expecting
+    deepseek to OCR it as a single document. That is only unambiguous when the
+    directory contains ONLY images: no PDFs and no subdirectories. The moment a PDF
+    or a subdirectory is present, ``source`` is a batch tree (the papers-library use
+    case) and must be walked recursively — treating it as one image-document would
+    silently drop every PDF and subdir (the HIGH bug this guard fixes).
 
-        logger.info(f"Processing file: {file_path}")
-        start_time = datetime.now()
+    Classification is OUTPUT-ROOT-AWARE so it is STABLE across runs. With the
+    default output root ``<input>/ocr/`` nested inside the scanned directory, the
+    first run creates that ``ocr/`` subtree; without this exclusion, a re-run would
+    see the new subdir, return False, and silently reclassify the SAME folder as a
+    batch tree (the run-1 aggregated ``scan/scan.md`` orphaned, per-image
+    ``page_0001_png/`` trees emitted on run 2, broken resume). The resolved output
+    root — and its own ``.md``/figure/metadata outputs — are excluded from the
+    scan so a first run and a re-run classify the same input identically.
+    """
+    if not source.is_dir():
+        return False
+    has_image = False
+    for p in source.iterdir():
+        # Skip the engine's own output subtree (default root nests in the input):
+        # it must not shift classification between runs.
+        if is_within_output_root(p, output_root):
+            continue
+        if p.is_dir():
+            return False
+        suffix = p.suffix.lower()
+        if suffix in _DOC_SUFFIXES:
+            return False
+        if suffix in _IMAGE_SUFFIXES:
+            has_image = True
+    return has_image
 
-        if self._backend.model is None:
-            self._backend.load_model()
 
-        try:
-            if is_pdf_file(file_path):
-                images = self._pdf_to_images(file_path)
-                page_count = len(images)
+def _discover_documents(source: Path, output_root: Path) -> tuple[list[Path], Path]:
+    """Return ``(documents, scan_root)`` for ``source``, excluding the output root.
 
-                if self.extract_images:
-                    base_name = sanitize_filename(file_path.stem)
-                    self._save_images(images, base_name)
-
-                page_data = [(idx, img) for idx, img in enumerate(images, 1)]
-
-                if self.workers == 1:
-                    outputs = []
-                    page_iterator = (
-                        tqdm(page_data, total=page_count, desc="OCR pages", unit="page")
-                        if show_progress and page_count > 1
-                        else page_data
-                    )
-                    for idx, image in page_iterator:
-                        logger.debug(f"Processing page {idx}/{page_count}")
-                        output = self._backend.process_image(image, prompt=prompt)
-                        outputs.append(f"## Page {idx}\n\n{output}")
-                else:
-                    results_dict: Dict[int, str] = {}
-                    errors: List[str] = []
-
-                    with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                        futures = {
-                            executor.submit(self._process_single_page, pd, prompt): pd[0]
-                            for pd in page_data
-                        }
-
-                        if show_progress and page_count > 1:
-                            pbar = tqdm(total=page_count, desc=f"OCR pages ({self.workers}w)", unit="page")
-                        else:
-                            pbar = None
-
-                        for future in as_completed(futures):
-                            page_num, text, error = future.result()
-                            if error:
-                                errors.append(f"Page {page_num}: {error}")
-                                results_dict[page_num] = f"[OCR Error: {error}]"
-                            else:
-                                results_dict[page_num] = text
-                            if pbar:
-                                pbar.update(1)
-
-                        if pbar:
-                            pbar.close()
-
-                    if errors:
-                        logger.warning(f"Errors on {len(errors)} pages: {errors}")
-
-                    outputs = [
-                        f"## Page {i}\n\n{results_dict[i]}"
-                        for i in sorted(results_dict.keys())
-                    ]
-
-                output_text = "\n\n".join(outputs)
-
-                if self.analyze_figures:
-                    figures = self._extract_figures_from_pdf(file_path)
-                    if figures:
-                        base_name = sanitize_filename(file_path.stem)
-                        self._save_figures(figures, base_name)
-                        self._analyze_figures(figures, show_progress=show_progress)
-                        output_text += self._figures_to_markdown(figures)
-
-            else:
-                image = load_image(file_path)
-                output_text = self._backend.process_image(image, prompt=prompt)
-                page_count = 1
-
-            processing_time = (datetime.now() - start_time).total_seconds()
-
-            metadata = {
-                "model": self._backend.model_name,
-                "backend": getattr(self._backend, "backend_name", "ollama"),
-            }
-
-            result = OCRResult(
-                input_path=file_path,
-                output_text=output_text,
-                page_count=page_count,
-                processing_time=processing_time,
-                metadata=metadata,
-            )
-
-            logger.info(
-                f"Processed {file_path.name} - {page_count} pages in {processing_time:.2f}s"
-            )
-
-            return result
-
-        except Exception as e:
-            raise RuntimeError(f"Failed to process {file_path}: {e}")
-
-    def process_batch(
-        self,
-        input_path: Path,
-        recursive: bool = False,
-        prompt: Optional[str] = None,
-        show_progress: bool = True,
-        reprocess: bool = False,
-    ) -> List[OCRResult]:
-        """Process multiple files from a directory.
-
-        Args:
-            reprocess: If True, reprocess files even if already in metadata.
-        """
-        files = collect_files(input_path, recursive=recursive)
-        logger.info(f"Found {len(files)} files to process")
-
-        metadata = MetadataManager(self.output_dir)
-
-        # Filter already-processed files unless reprocess is requested
-        if not reprocess:
-            to_process = []
-            skipped = 0
-            for f in files:
-                if metadata.is_processed(f):
-                    skipped += 1
-                else:
-                    to_process.append(f)
-            if skipped:
-                logger.info(f"Skipping {skipped} already-processed files")
-            files = to_process
-
-        if self._backend.model is None:
-            self._backend.load_model()
-
-        results = []
-        iterator = tqdm(files, desc="Processing files") if show_progress else files
-
-        for file_path in iterator:
-            try:
-                result = self.process_file(file_path, prompt=prompt)
-                results.append(result)
-                output_path = self.save_result(result)
-
-                metadata.record(
-                    file_path,
-                    pages=result.page_count,
-                    processing_time=result.processing_time,
-                    model=result.metadata.get("model", ""),
-                    backend=result.metadata.get("backend", ""),
-                    output_path=str(output_path.relative_to(self.output_dir)),
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to process {file_path}: {e}")
-                continue
-
-        logger.info(f"Successfully processed {len(results)}/{len(files)} files")
-        return results
-
-    def save_result(self, result: OCRResult, output_path: Optional[Path] = None) -> Path:
-        if output_path is None:
-            base_name = sanitize_filename(result.input_path.stem)
-            output_path = self.output_dir / base_name / f"{base_name}.md"
-
-        ensure_dir(output_path.parent)
-
-        markdown_content = result.to_markdown(include_metadata=self.include_metadata)
-        output_path.write_text(markdown_content, encoding="utf-8")
-
-        logger.info(f"Saved result to: {output_path}")
-        return output_path
+    * A bare ``.pdf`` or image file is one document (scan root = its parent).
+    * A directory that contains ONLY page images (no PDFs, no subdirs) is a SINGLE
+      image-dir document keyed by its folder name (scan root = its parent).
+    * Otherwise the directory is a batch tree: every ``.pdf``/image under it is one
+      document, discovered via the contract's :func:`iter_input_files`, which prunes
+      the resolved ``output_root`` subtree so prior outputs are never re-ingested.
+    """
+    if source.is_file():
+        return [source], source.parent
+    if not source.is_dir():
+        return [], source
+    if _is_image_dir_document(source, output_root):
+        # The image-dir document keys on its own folder name (no file stem).
+        return [source], source.parent
+    suffixes = _DOC_SUFFIXES | _IMAGE_SUFFIXES
+    documents = list(iter_input_files(source, output_root, suffixes=suffixes))
+    return documents, source

@@ -1,8 +1,14 @@
-"""Command-line interface for DeepSeek OCR."""
+"""Command-line interface for DeepSeek OCR.
+
+Output is written through the shared ``ocr-output-contract`` package so deepseek's
+output is byte-structure-identical to the rest of the engine family: default root
+``<input-parent>/ocr/`` (``-o`` overrides, never required), one
+``<root>/<rel/dir>/<stem>/<stem>.md`` per document under ``## Page N`` headers, dual
+metadata sidecars, and a nonzero exit on any failure.
+"""
 
 import sys
 from pathlib import Path
-from typing import Optional
 
 import click
 from rich.console import Console
@@ -11,8 +17,9 @@ from rich.table import Table
 from deepseek_ocr import __version__
 from deepseek_ocr.backends import create_backend
 from deepseek_ocr.config import settings
-from deepseek_ocr.processor import OCRProcessor
-from deepseek_ocr.utils import collect_files, is_pdf_file, setup_logging
+from deepseek_ocr.processor import _IMAGE_SUFFIXES, discover_documents
+from deepseek_ocr.processor import process as run_process
+from deepseek_ocr.utils import is_pdf_file, setup_logging
 
 console = Console()
 err_console = Console(stderr=True)
@@ -23,7 +30,7 @@ def print_banner(quiet: bool = False) -> None:
         console.print(f"[dim]deepseek-ocr v{__version__}[/dim]")
 
 
-def _format_size(size_bytes: int) -> str:
+def _format_size(size_bytes: float) -> str:
     """Format byte count as human-readable string."""
     for unit in ("B", "KB", "MB", "GB"):
         if size_bytes < 1024:
@@ -42,9 +49,16 @@ def _get_pdf_page_count(path: Path) -> int:
     return count
 
 
-def _run_dry_run(input_path: Path, recursive: bool, quiet: bool) -> None:
-    """List files that would be processed without actually processing them."""
-    files = collect_files(input_path, recursive=recursive)
+def _run_dry_run(input_path: Path, output_dir: Path | None, quiet: bool) -> None:
+    """List documents that would be processed, using the REAL discovery.
+
+    Uses the same :func:`discover_documents` (and the same resolved output root,
+    so prior outputs are excluded) as the real run, so the preview can never
+    diverge from what is actually processed.
+    """
+    files = discover_documents(input_path, output_dir)
+    if not files:
+        raise ValueError(f"no documents found at {input_path}")
 
     if quiet:
         for f in files:
@@ -62,25 +76,34 @@ def _run_dry_run(input_path: Path, recursive: bool, quiet: bool) -> None:
     total_pages = 0
 
     for idx, f in enumerate(files, 1):
-        size = f.stat().st_size
-        total_size += size
-
-        if is_pdf_file(f):
-            try:
-                pages = _get_pdf_page_count(f)
-            except Exception:
-                pages = 0
-            file_type = "PDF"
+        if f.is_dir():
+            # An image directory is OCR'd as ONE document, one page per image.
+            # Count ONLY the image files the real run (_gather_images) processes, so
+            # the preview never over-reports pages for a dir holding stray non-image
+            # files (the dry-run/real-run divergence the review flagged).
+            images = [p for p in f.iterdir() if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES]
+            size = sum(p.stat().st_size for p in images)
+            pages = len(images)
+            file_type = "IMG DIR"
         else:
-            pages = 1
-            file_type = f.suffix.upper().lstrip(".")
+            size = f.stat().st_size
+            if is_pdf_file(f):
+                try:
+                    pages = _get_pdf_page_count(f)
+                except Exception:
+                    pages = 0
+                file_type = "PDF"
+            else:
+                pages = 1
+                file_type = f.suffix.upper().lstrip(".")
 
+        total_size += size
         total_pages += pages
         table.add_row(str(idx), f.name, file_type, _format_size(size), str(pages))
 
     console.print(table)
     console.print(
-        f"\n[bold]{len(files)}[/bold] files, "
+        f"\n[bold]{len(files)}[/bold] documents, "
         f"[bold]{_format_size(total_size)}[/bold] total, "
         f"[bold]{total_pages}[/bold] pages"
     )
@@ -99,7 +122,8 @@ def cli(ctx: click.Context) -> None:
         deepseek-ocr ./papers/ --recursive
         deepseek-ocr document.pdf --dry-run
 
-    Supports Ollama (local, default) and vLLM (OpenAI-compatible API) backends.
+    Output goes to <input-parent>/ocr/ by default (-o overrides; never required).
+    Supports Ollama (local, default) and vLLM (OpenAI-compatible) backends.
     """
     ctx.ensure_object(dict)
 
@@ -110,118 +134,115 @@ def cli(ctx: click.Context) -> None:
     "-o",
     "--output-dir",
     type=click.Path(path_type=Path),
-    help="Output directory for results",
+    default=None,
+    help="Output root (default: <input-parent>/ocr/). Writes <stem>/<stem>.md per document.",
 )
 @click.option(
     "-r",
     "--recursive",
     is_flag=True,
-    help="Recursively process directories",
+    help="Accepted for backward compatibility; batch directory trees are ALWAYS walked recursively.",
 )
 @click.option(
     "--model",
     "model_name",
     type=str,
-    default="deepseek-ocr",
-    help="Ollama model name (default: deepseek-ocr)",
+    default=None,
+    help="Model name. CLI wins; else DEEPSEEK_OCR_MODEL_NAME / settings (default: deepseek-ocr).",
 )
 @click.option(
     "--prompt",
     type=str,
-    help="Custom prompt for OCR",
+    default=None,
+    help="Custom prompt for OCR (overrides --task).",
 )
 @click.option(
     "--task",
     type=click.Choice(["convert", "ocr", "layout", "extract", "parse"]),
     default="convert",
-    help="OCR task type",
-)
-@click.option(
-    "--extract-images",
-    is_flag=True,
-    help="Extract and save page images from PDFs",
-)
-@click.option(
-    "--no-metadata",
-    is_flag=True,
-    help="Exclude metadata from output",
+    show_default=True,
+    help="OCR task type; selects the backend prompt unless --prompt is given.",
 )
 @click.option(
     "--dpi",
     type=int,
     default=200,
-    help="PDF rendering DPI (default: 200, higher=slower but better quality)",
-)
-@click.option(
-    "-w",
-    "--workers",
-    type=int,
-    default=1,
-    help="Parallel workers for PDF pages (default: 1). Note: Ollama processes sequentially, so >1 workers mainly overlap I/O, not GPU inference.",
+    show_default=True,
+    help="PDF rendering DPI (higher=slower but better quality).",
 )
 @click.option(
     "--analyze-figures",
     is_flag=True,
-    help="Extract and analyze embedded figures/images from PDFs with AI descriptions.",
+    help="Extract and describe embedded figures/images from PDFs.",
+)
+@click.option(
+    "--raw",
+    is_flag=True,
+    help="Keep the model's verbatim output (skip clean_ocr_output, which strips [[d,d,d,d]] boxes and <...> spans).",
+)
+@click.option(
+    "--max-tokens",
+    type=int,
+    default=None,
+    help="Max tokens per page response (default: 8192 or DEEPSEEK_OCR_MAX_TOKENS). Raise if dense pages truncate.",
 )
 @click.option(
     "--max-dim",
     "max_dimension",
     type=int,
     default=None,
-    help="Maximum image dimension (width or height). Larger images are resized to prevent timeouts. Default: 1920. Set to 0 to disable.",
+    help="Maximum image dimension. Larger images are resized to prevent timeouts. 0 disables.",
 )
 @click.option(
     "--backend",
     type=click.Choice(["ollama", "vllm"]),
     default=None,
-    help="Backend to use: 'ollama' (local, default) or 'vllm' (OpenAI-compatible). Can also set DEEPSEEK_OCR_BACKEND env var.",
+    help="Backend: 'ollama' (local, default) or 'vllm'. Or set DEEPSEEK_OCR_BACKEND.",
 )
 @click.option(
     "--vllm-url",
     "vllm_base_url",
     type=str,
     default=None,
-    help="vLLM API URL (default: http://localhost:8000/v1). Can also set DEEPSEEK_OCR_VLLM_BASE_URL env var.",
+    help="vLLM API URL (default: http://localhost:8000/v1). Or set DEEPSEEK_OCR_VLLM_BASE_URL.",
 )
 @click.option(
     "--reprocess",
     is_flag=True,
-    help="Force reprocessing of already-processed files in batch mode.",
+    help="Re-OCR documents already recorded completed.",
 )
 @click.option(
     "--dry-run",
     is_flag=True,
-    help="List files that would be processed without running OCR. Shows file count, sizes, and page counts.",
+    help="List files that would be processed without running OCR.",
 )
 @click.option(
     "-q",
     "--quiet",
     is_flag=True,
-    help="Suppress non-error output. Only print file paths on success (useful for scripting).",
+    help="Suppress non-error output. Print one output .md path per line (for scripting).",
 )
 @click.option(
     "--verbose",
     is_flag=True,
-    help="Enable verbose output",
+    help="Enable verbose output.",
 )
 @click.pass_context
 def process(
     ctx: click.Context,
     input_path: Path,
-    output_dir: Optional[Path],
+    output_dir: Path | None,
     recursive: bool,
-    model_name: str,
-    prompt: Optional[str],
+    model_name: str | None,
+    prompt: str | None,
     task: str,
-    extract_images: bool,
-    no_metadata: bool,
     dpi: int,
-    workers: int,
     analyze_figures: bool,
-    max_dimension: Optional[int],
-    backend: Optional[str],
-    vllm_base_url: Optional[str],
+    raw: bool,
+    max_tokens: int | None,
+    max_dimension: int | None,
+    backend: str | None,
+    vllm_base_url: str | None,
     reprocess: bool,
     dry_run: bool,
     quiet: bool,
@@ -229,9 +250,8 @@ def process(
 ) -> None:
     """Process documents and images with OCR.
 
-    INPUT_PATH can be a single file or a directory containing multiple files.
-
-    Supported formats: PDF, JPG, PNG, WEBP, GIF, BMP, TIFF
+    INPUT_PATH can be a single file, a directory of page images (one document), or
+    a tree of documents (batch). Supported: PDF, JPG, PNG, WEBP, GIF, BMP, TIFF.
 
     \b
     Examples:
@@ -246,7 +266,7 @@ def process(
     if dry_run:
         print_banner(quiet=quiet)
         try:
-            _run_dry_run(input_path, recursive=recursive, quiet=quiet)
+            _run_dry_run(input_path, output_dir=output_dir, quiet=quiet)
         except Exception as e:
             err_console.print(f"[red]error:[/red] {e}")
             sys.exit(1)
@@ -254,77 +274,64 @@ def process(
 
     print_banner(quiet=quiet)
 
-    # Resolve backend from CLI flag or config
+    # Resolve backend from CLI flag or config.
     backend_type = backend or settings.backend
 
-    # For vLLM, default model is deepseek-vl2 unless explicitly specified
-    if backend_type == "vllm" and model_name == "deepseek-ocr":
-        model_name = "deepseek-vl2"
+    # Resolve the model: an explicit --model on the command line wins; otherwise
+    # fall back to settings.model_name (which honors DEEPSEEK_OCR_MODEL_NAME / .env),
+    # NOT a click default that would silently shadow the env var. We treat the model
+    # as "unset" when --model was not passed AND the env did not override the default.
+    model_from_cli = model_name is not None
+    resolved_model: str = model_name if model_name is not None else settings.model_name
+    model_is_default = not model_from_cli and resolved_model == "deepseek-ocr"
+
+    # For vLLM, default model is deepseek-vl2 unless a model was explicitly chosen.
+    if backend_type == "vllm" and model_is_default:
+        resolved_model = "deepseek-vl2"
 
     try:
         backend_instance = create_backend(
             backend_type=backend_type,
-            model_name=model_name,
+            model_name=resolved_model,
             max_dimension=max_dimension,
+            max_tokens=max_tokens,
             ollama_url=settings.ollama_url,
             vllm_base_url=vllm_base_url or settings.vllm_base_url,
         )
-        backend_instance.load_model()
 
-        processor_kwargs = {
-            "backend": backend_instance,
-            "extract_images": extract_images,
-            "include_metadata": not no_metadata,
-            "dpi": dpi,
-            "workers": workers,
-            "analyze_figures": analyze_figures,
-        }
-        if output_dir:
-            processor_kwargs["output_dir"] = output_dir
-
-        processor = OCRProcessor(**processor_kwargs)
-
-        if input_path.is_file():
-            result = processor.process_file(input_path, prompt=prompt, show_progress=not verbose and not quiet)
-            output_path = processor.save_result(result)
-            if quiet:
-                console.print(str(output_path))
-            else:
-                console.print(f"[dim]->[/dim] {output_path}")
-        else:
-            results = processor.process_batch(
-                input_path,
-                recursive=recursive,
-                prompt=prompt,
-                show_progress=not verbose and not quiet,
-                reprocess=reprocess,
-            )
-
-            if quiet:
-                for result in results:
-                    base_name = result.input_path.stem
-                    output_path = processor.output_dir / base_name / f"{base_name}.md"
-                    console.print(str(output_path))
-            else:
-                table = Table(show_header=True, header_style="bold")
-                table.add_column("File", style="cyan")
-                table.add_column("Pages", justify="right")
-                table.add_column("Time (s)", justify="right")
-
-                for result in results:
-                    table.add_row(
-                        result.input_path.name,
-                        str(result.page_count),
-                        f"{result.processing_time:.2f}",
-                    )
-
-                console.print(table)
+        outcome = run_process(
+            input_path,
+            backend_instance,
+            dpi=dpi,
+            task=task,
+            prompt=prompt,
+            output_dir=output_dir,
+            reprocess=reprocess,
+            analyze_figures=analyze_figures,
+            raw=raw,
+        )
 
         backend_instance.unload_model()
-
     except Exception as e:
         err_console.print(f"[red]error:[/red] {e}")
         sys.exit(1)
+
+    total = outcome.completed + outcome.failed + outcome.partial
+    if quiet:
+        for path in outcome.outputs:
+            console.print(path)
+    else:
+        console.print(f"[dim]deepseek-ocr: backend={backend_type} dpi={dpi}[/dim]")
+        console.print(f"  {outcome.completed}/{total} document(s) completed")
+        if outcome.has_failures:
+            err_console.print(
+                f"  {outcome.failed} failed, {outcome.partial} partial: "
+                + ", ".join(outcome.failures)
+            )
+
+    # Uniform exit policy (canon SYS-02): nonzero if any document/page failed.
+    if outcome.exit_code != 0:
+        sys.exit(outcome.exit_code)
 
 
 @cli.command()
@@ -339,7 +346,6 @@ def info() -> None:
     sys_table.add_row("Python", f"{sys.version_info.major}.{sys.version_info.minor}")
     sys_table.add_row("Backend", settings.backend)
 
-    # Check Ollama status
     from deepseek_ocr.backends.ollama import OllamaBackend
 
     ollama_backend = OllamaBackend()
@@ -358,8 +364,7 @@ def info() -> None:
     settings_table.add_column("Value", style="yellow")
 
     settings_table.add_row("Model", settings.model_name)
-    settings_table.add_row("Output Directory", str(settings.output_dir))
-    settings_table.add_row("Extract Images", str(settings.extract_images))
+    settings_table.add_row("Output root default", "<input-parent>/ocr/")
     settings_table.add_row("Max Image Dimension", str(settings.max_dimension))
 
     console.print(settings_table)
@@ -396,11 +401,7 @@ def main() -> None:
             candidate = argv[first_non_option_index]
 
             if candidate not in known_subcommands and Path(candidate).exists():
-                argv = (
-                    argv[:first_non_option_index]
-                    + ["process"]
-                    + argv[first_non_option_index:]
-                )
+                argv = argv[:first_non_option_index] + ["process"] + argv[first_non_option_index:]
                 sys.argv = [sys.argv[0], *argv]
 
     cli(obj={})

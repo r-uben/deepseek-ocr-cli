@@ -3,7 +3,6 @@
 import logging
 import re
 from pathlib import Path
-from typing import List
 
 from PIL import Image
 
@@ -14,7 +13,16 @@ SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | {PDF_EXTENSION}
 
 
 def setup_logging(level: str = "WARNING", verbose: bool = False) -> logging.Logger:
-    log_level = logging.DEBUG if verbose else logging.WARNING
+    """Configure logging. ``--verbose`` forces DEBUG; otherwise honor ``level``.
+
+    ``level`` accepts a level name (e.g. ``"INFO"``, ``"WARNING"``) or number, so
+    ``DEEPSEEK_OCR_LOG_LEVEL`` is no longer a dead setting.
+    """
+    if verbose:
+        log_level: int = logging.DEBUG
+    else:
+        resolved = logging.getLevelName(str(level).upper())
+        log_level = resolved if isinstance(resolved, int) else logging.WARNING
 
     logging.basicConfig(
         level=log_level,
@@ -37,11 +45,11 @@ def is_pdf_file(file_path: Path) -> bool:
     return file_path.suffix.lower() == PDF_EXTENSION
 
 
-def collect_files(input_path: Path, recursive: bool = False) -> List[Path]:
+def collect_files(input_path: Path, recursive: bool = False) -> list[Path]:
     if not input_path.exists():
         raise FileNotFoundError(f"Path not found: {input_path}")
 
-    files: List[Path] = []
+    files: list[Path] = []
 
     if input_path.is_file():
         if is_supported_file(input_path):
@@ -127,14 +135,14 @@ def ensure_dir(directory: Path) -> Path:
 
 def _html_table_to_markdown(html_table: str) -> str:
     rows = []
-    row_matches = re.findall(r'<tr[^>]*>(.*?)</tr>', html_table, re.DOTALL | re.IGNORECASE)
+    row_matches = re.findall(r"<tr[^>]*>(.*?)</tr>", html_table, re.DOTALL | re.IGNORECASE)
 
     for row_html in row_matches:
-        cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row_html, re.DOTALL | re.IGNORECASE)
+        cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row_html, re.DOTALL | re.IGNORECASE)
         cleaned_cells = []
         for cell in cells:
-            cell = re.sub(r'<[^>]+>', '', cell)
-            cell = ' '.join(cell.split())
+            cell = re.sub(r"<[^>]+>", "", cell)
+            cell = " ".join(cell.split())
             cleaned_cells.append(cell)
         if cleaned_cells:
             rows.append(cleaned_cells)
@@ -153,38 +161,38 @@ def _html_table_to_markdown(html_table: str) -> str:
 
 def clean_ocr_output(text: str) -> str:
     """Remove grounding annotations, convert HTML tables to markdown, decode entities."""
-    text = re.sub(r'<\|ref\|>.*?<\|/ref\|>', '', text)
-    text = re.sub(r'<\|det\|>\[\[.*?\]\]<\|/det\|>', '', text)
-    text = re.sub(r'<\|[^|]+\|>', '', text)
+    text = re.sub(r"<\|ref\|>.*?<\|/ref\|>", "", text)
+    text = re.sub(r"<\|det\|>\[\[.*?\]\]<\|/det\|>", "", text)
+    text = re.sub(r"<\|[^|]+\|>", "", text)
     # Strip bare bounding box coordinates that leak through without tags
     # e.g., "text[[114, 531, 883, 619]]" → "text"
-    text = re.sub(r'\[\[\d+,\s*\d+,\s*\d+,\s*\d+\]\]', '', text)
+    text = re.sub(r"\[\[\d+,\s*\d+,\s*\d+,\s*\d+\]\]", "", text)
 
     def replace_table(match: re.Match) -> str:
         return _html_table_to_markdown(match.group(0))
 
-    text = re.sub(r'<table[^>]*>.*?</table>', replace_table, text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<table[^>]*>.*?</table>", replace_table, text, flags=re.DOTALL | re.IGNORECASE)
 
-    text = re.sub(r'<(sup|sub)>([^<]*)</\1>', r'^\2', text, flags=re.IGNORECASE)
-    text = re.sub(r'<center>([^<]*)</center>', r'\1', text, flags=re.IGNORECASE)
-    text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r"<(sup|sub)>([^<]*)</\1>", r"^\2", text, flags=re.IGNORECASE)
+    text = re.sub(r"<center>([^<]*)</center>", r"\1", text, flags=re.IGNORECASE)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
 
     html_entities = {
-        '&amp;': '&',
-        '&lt;': '<',
-        '&gt;': '>',
-        '&quot;': '"',
-        '&apos;': "'",
-        '&nbsp;': ' ',
-        '&#39;': "'",
-        '&#x27;': "'",
+        "&amp;": "&",
+        "&lt;": "<",
+        "&gt;": ">",
+        "&quot;": '"',
+        "&apos;": "'",
+        "&nbsp;": " ",
+        "&#39;": "'",
+        "&#x27;": "'",
     }
     for entity, char in html_entities.items():
         text = text.replace(entity, char)
 
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    lines = [line.strip() for line in text.split('\n')]
-    text = '\n'.join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    lines = [line.strip() for line in text.split("\n")]
+    text = "\n".join(lines)
     text = text.strip()
     return text

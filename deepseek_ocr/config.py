@@ -1,6 +1,5 @@
 """Configuration management for DeepSeek OCR CLI."""
 
-from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
@@ -43,18 +42,10 @@ class Settings(BaseSettings):
         description="Maximum image dimension (width or height). Larger images are resized to prevent Ollama timeouts. Set to 0 to disable.",
     )
 
-    # Output configuration
-    output_dir: Path = Field(
-        default=Path("output"),
-        description="Default output directory",
-    )
-    extract_images: bool = Field(
-        default=False,
-        description="Extract and save images from documents",
-    )
-    include_metadata: bool = Field(
-        default=True,
-        description="Include metadata in output markdown",
+    # Generation
+    max_tokens: int = Field(
+        default=8192,
+        description="Maximum tokens per page response. Dense full pages can exceed the old 2048 default and truncate (silent content loss); raise if pages truncate.",
     )
 
     # Retry configuration

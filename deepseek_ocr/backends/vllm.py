@@ -4,7 +4,6 @@ import base64
 import io
 import logging
 from pathlib import Path
-from typing import Union
 
 from PIL import Image
 
@@ -27,6 +26,7 @@ class VLLMBackend(Backend):
         max_dimension: int | None = None,
         max_retries: int | None = None,
         retry_delay: float | None = None,
+        max_tokens: int | None = None,
     ):
         super().__init__(
             model_name=model_name,
@@ -34,6 +34,7 @@ class VLLMBackend(Backend):
             max_retries=max_retries if max_retries is not None else settings.max_retries,
             retry_delay=retry_delay if retry_delay is not None else settings.retry_delay,
         )
+        self.max_tokens = max_tokens if max_tokens is not None else settings.max_tokens
         self.base_url = base_url or getattr(settings, "vllm_base_url", None) or VLLM_DEFAULT_URL
         self._client = None
         logger.info(f"Initialized VLLMBackend with model: {self.model_name} at {self.base_url}")
@@ -52,8 +53,7 @@ class VLLMBackend(Backend):
             import openai
         except ImportError:
             raise RuntimeError(
-                "openai package is required for vLLM backend. "
-                "Install with: pip install openai"
+                "openai package is required for vLLM backend. Install with: pip install openai"
             )
 
         logger.info(f"Connecting to vLLM at {self.base_url}")
@@ -76,8 +76,7 @@ class VLLMBackend(Backend):
                 )
         except Exception as e:
             raise RuntimeError(
-                f"Failed to connect to vLLM at {self.base_url}: {e}. "
-                "Is the vLLM server running?"
+                f"Failed to connect to vLLM at {self.base_url}: {e}. Is the vLLM server running?"
             )
 
         self.model = True
@@ -95,8 +94,13 @@ class VLLMBackend(Backend):
         b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
         return f"data:image/jpeg;base64,{b64}"
 
-    def _call_vllm_api(self, image_url: str, prompt: str) -> str:
-        """Make the vLLM API call, raising TransientError for retryable failures."""
+    def _call_vllm_api(self, image_url: str, prompt: str) -> tuple[str, str | None]:
+        """Make the vLLM API call, returning ``(text, finish_reason)``.
+
+        Raises TransientError for retryable failures. The ``finish_reason`` is
+        threaded out so the processor can detect length-truncated pages instead
+        of recording an incomplete page as a silent success.
+        """
         import openai
 
         try:
@@ -117,10 +121,11 @@ class VLLMBackend(Backend):
                         ],
                     }
                 ],
-                max_tokens=2048,
+                max_tokens=self.max_tokens,
                 temperature=0.1,
             )
-            return response.choices[0].message.content or ""
+            choice = response.choices[0]
+            return (choice.message.content or "", getattr(choice, "finish_reason", None))
 
         except openai.APITimeoutError as e:
             raise TransientError(f"vLLM request timed out: {e}", original=e)
@@ -133,20 +138,31 @@ class VLLMBackend(Backend):
         except openai.APIStatusError as e:
             # 502, 503, 504 come through as APIStatusError
             if e.status_code in {502, 503, 504}:
-                raise TransientError(
-                    f"vLLM HTTP {e.status_code}: {e}", original=e
-                )
+                raise TransientError(f"vLLM HTTP {e.status_code}: {e}", original=e)
             # Non-transient (400, 404, etc.) — don't retry
             raise RuntimeError(f"vLLM API error (HTTP {e.status_code}): {e}")
 
     def process_image(
         self,
-        image: Union[Image.Image, Path, str],
+        image: Image.Image | Path | str,
         prompt: str | None = None,
         task: str = "convert",
         return_raw: bool = False,
     ) -> str:
         """Process image and return OCR text using vLLM."""
+        text, _finish_reason = self.process_image_with_meta(
+            image, prompt=prompt, task=task, return_raw=return_raw
+        )
+        return text
+
+    def process_image_with_meta(
+        self,
+        image: Image.Image | Path | str,
+        prompt: str | None = None,
+        task: str = "convert",
+        return_raw: bool = False,
+    ) -> tuple[str, str | None]:
+        """Process image and return ``(text, finish_reason)`` using vLLM."""
         if not self.model or self._client is None:
             raise RuntimeError("Model not loaded. Call load_model() first")
 
@@ -166,7 +182,7 @@ class VLLMBackend(Backend):
         image = resize_image_if_needed(image, self.max_dimension)
         image_url = self._image_to_base64_url(image)
 
-        raw_text = self._retry(self._call_vllm_api, image_url, prompt)
+        raw_text, finish_reason = self._retry(self._call_vllm_api, image_url, prompt)
         if return_raw:
-            return raw_text
-        return clean_ocr_output(raw_text)
+            return raw_text, finish_reason
+        return clean_ocr_output(raw_text), finish_reason

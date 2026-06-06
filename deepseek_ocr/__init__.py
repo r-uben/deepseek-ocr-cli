@@ -5,10 +5,11 @@ __author__ = "Ruben Fernandez Fuertes"
 __license__ = "MIT"
 
 from deepseek_ocr.backends import Backend, OllamaBackend, VLLMBackend, create_backend
-from deepseek_ocr.processor import OCRProcessor
+from deepseek_ocr.processor import discover_documents, process
 
 __all__ = [
-    "OCRProcessor",
+    "process",
+    "discover_documents",
     "Backend",
     "OllamaBackend",
     "VLLMBackend",
