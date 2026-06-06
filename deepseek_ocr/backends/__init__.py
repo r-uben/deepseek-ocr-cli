@@ -13,6 +13,7 @@ def create_backend(
     max_dimension: int | None = None,
     max_retries: int | None = None,
     retry_delay: float | None = None,
+    max_tokens: int | None = None,
     **kwargs,
 ) -> Backend:
     """Factory function to create the appropriate backend.
@@ -23,6 +24,7 @@ def create_backend(
         max_dimension: Maximum image dimension for resizing
         max_retries: Maximum number of retries for transient errors
         retry_delay: Base delay in seconds between retries
+        max_tokens: Maximum tokens per page response (truncation control)
         **kwargs: Additional backend-specific arguments
 
     Returns:
@@ -36,6 +38,7 @@ def create_backend(
             max_dimension=max_dimension,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            max_tokens=max_tokens,
             ollama_url=kwargs.get("ollama_url"),
         )
     elif backend_type == "vllm":
@@ -44,6 +47,7 @@ def create_backend(
             max_dimension=max_dimension,
             max_retries=max_retries,
             retry_delay=retry_delay,
+            max_tokens=max_tokens,
             base_url=kwargs.get("vllm_base_url"),
         )
     else:

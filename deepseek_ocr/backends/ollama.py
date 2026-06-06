@@ -4,7 +4,6 @@ import base64
 import io
 import logging
 from pathlib import Path
-from typing import Union
 
 import requests
 from PIL import Image
@@ -31,6 +30,7 @@ class OllamaBackend(Backend):
         max_dimension: int | None = None,
         max_retries: int | None = None,
         retry_delay: float | None = None,
+        max_tokens: int | None = None,
     ):
         super().__init__(
             model_name=model_name,
@@ -38,6 +38,7 @@ class OllamaBackend(Backend):
             max_retries=max_retries if max_retries is not None else settings.max_retries,
             retry_delay=retry_delay if retry_delay is not None else settings.retry_delay,
         )
+        self.max_tokens = max_tokens if max_tokens is not None else settings.max_tokens
         self.ollama_url = ollama_url or settings.ollama_url or OLLAMA_API_URL
         logger.info(f"Initialized OllamaBackend with model: {self.model_name}")
 
@@ -94,8 +95,14 @@ class OllamaBackend(Backend):
         image.save(buffer, format="JPEG", quality=95)
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
-    def _call_ollama_api(self, image_b64: str, prompt: str) -> str:
-        """Make the Ollama API call, raising TransientError for retryable failures."""
+    def _call_ollama_api(self, image_b64: str, prompt: str) -> tuple[str, str | None]:
+        """Make the Ollama API call, returning ``(text, finish_reason)``.
+
+        Raises TransientError for retryable failures. Ollama reports the stop
+        reason as ``done_reason`` (e.g. ``"length"`` when the response hit
+        ``num_predict``); it is threaded out so the processor can flag truncated
+        pages instead of recording an incomplete page as a silent success.
+        """
         try:
             response = requests.post(
                 f"{self.ollama_url}/api/generate",
@@ -106,6 +113,7 @@ class OllamaBackend(Backend):
                     "stream": False,
                     "options": {
                         "num_ctx": 8192,
+                        "num_predict": self.max_tokens,
                         "temperature": 0.1,
                     },
                 },
@@ -124,16 +132,30 @@ class OllamaBackend(Backend):
         if response.status_code != 200:
             raise RuntimeError(f"Ollama API error: {response.text}")
 
-        return response.json().get("response", "")
+        payload = response.json()
+        return payload.get("response", ""), payload.get("done_reason")
 
     def process_image(
         self,
-        image: Union[Image.Image, Path, str],
+        image: Image.Image | Path | str,
         prompt: str | None = None,
         task: str = "convert",
         return_raw: bool = False,
     ) -> str:
         """Process image and return OCR text."""
+        text, _finish_reason = self.process_image_with_meta(
+            image, prompt=prompt, task=task, return_raw=return_raw
+        )
+        return text
+
+    def process_image_with_meta(
+        self,
+        image: Image.Image | Path | str,
+        prompt: str | None = None,
+        task: str = "convert",
+        return_raw: bool = False,
+    ) -> tuple[str, str | None]:
+        """Process image and return ``(text, finish_reason)``."""
         if not self.model:
             raise RuntimeError("Model not loaded. Call load_model() first")
 
@@ -153,7 +175,7 @@ class OllamaBackend(Backend):
         image = resize_image_if_needed(image, self.max_dimension)
         image_b64 = self._image_to_base64(image)
 
-        raw_text = self._retry(self._call_ollama_api, image_b64, prompt)
+        raw_text, finish_reason = self._retry(self._call_ollama_api, image_b64, prompt)
         if return_raw:
-            return raw_text
-        return clean_ocr_output(raw_text)
+            return raw_text, finish_reason
+        return clean_ocr_output(raw_text), finish_reason

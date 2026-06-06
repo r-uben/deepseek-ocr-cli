@@ -17,8 +17,9 @@ from rich.table import Table
 from deepseek_ocr import __version__
 from deepseek_ocr.backends import create_backend
 from deepseek_ocr.config import settings
+from deepseek_ocr.processor import discover_documents
 from deepseek_ocr.processor import process as run_process
-from deepseek_ocr.utils import collect_files, is_pdf_file, setup_logging
+from deepseek_ocr.utils import is_pdf_file, setup_logging
 
 console = Console()
 err_console = Console(stderr=True)
@@ -48,9 +49,16 @@ def _get_pdf_page_count(path: Path) -> int:
     return count
 
 
-def _run_dry_run(input_path: Path, recursive: bool, quiet: bool) -> None:
-    """List files that would be processed without actually processing them."""
-    files = collect_files(input_path, recursive=recursive)
+def _run_dry_run(input_path: Path, output_dir: Path | None, quiet: bool) -> None:
+    """List documents that would be processed, using the REAL discovery.
+
+    Uses the same :func:`discover_documents` (and the same resolved output root,
+    so prior outputs are excluded) as the real run, so the preview can never
+    diverge from what is actually processed.
+    """
+    files = discover_documents(input_path, output_dir)
+    if not files:
+        raise ValueError(f"no documents found at {input_path}")
 
     if quiet:
         for f in files:
@@ -68,25 +76,31 @@ def _run_dry_run(input_path: Path, recursive: bool, quiet: bool) -> None:
     total_pages = 0
 
     for idx, f in enumerate(files, 1):
-        size = f.stat().st_size
-        total_size += size
-
-        if is_pdf_file(f):
-            try:
-                pages = _get_pdf_page_count(f)
-            except Exception:
-                pages = 0
-            file_type = "PDF"
+        if f.is_dir():
+            # An image directory is OCR'd as ONE document, one page per image.
+            images = [p for p in f.iterdir() if p.is_file()]
+            size = sum(p.stat().st_size for p in images)
+            pages = len(images)
+            file_type = "IMG DIR"
         else:
-            pages = 1
-            file_type = f.suffix.upper().lstrip(".")
+            size = f.stat().st_size
+            if is_pdf_file(f):
+                try:
+                    pages = _get_pdf_page_count(f)
+                except Exception:
+                    pages = 0
+                file_type = "PDF"
+            else:
+                pages = 1
+                file_type = f.suffix.upper().lstrip(".")
 
+        total_size += size
         total_pages += pages
         table.add_row(str(idx), f.name, file_type, _format_size(size), str(pages))
 
     console.print(table)
     console.print(
-        f"\n[bold]{len(files)}[/bold] files, "
+        f"\n[bold]{len(files)}[/bold] documents, "
         f"[bold]{_format_size(total_size)}[/bold] total, "
         f"[bold]{total_pages}[/bold] pages"
     )
@@ -124,7 +138,7 @@ def cli(ctx: click.Context) -> None:
     "-r",
     "--recursive",
     is_flag=True,
-    help="Recursively process directories (reserved; batch trees are walked recursively).",
+    help="Accepted for backward compatibility; batch directory trees are ALWAYS walked recursively.",
 )
 @click.option(
     "--model",
@@ -157,6 +171,17 @@ def cli(ctx: click.Context) -> None:
     "--analyze-figures",
     is_flag=True,
     help="Extract and describe embedded figures/images from PDFs.",
+)
+@click.option(
+    "--raw",
+    is_flag=True,
+    help="Keep the model's verbatim output (skip clean_ocr_output, which strips [[d,d,d,d]] boxes and <...> spans).",
+)
+@click.option(
+    "--max-tokens",
+    type=int,
+    default=None,
+    help="Max tokens per page response (default: 8192 or DEEPSEEK_OCR_MAX_TOKENS). Raise if dense pages truncate.",
 )
 @click.option(
     "--max-dim",
@@ -210,6 +235,8 @@ def process(
     task: str,
     dpi: int,
     analyze_figures: bool,
+    raw: bool,
+    max_tokens: int | None,
     max_dimension: int | None,
     backend: str | None,
     vllm_base_url: str | None,
@@ -236,7 +263,7 @@ def process(
     if dry_run:
         print_banner(quiet=quiet)
         try:
-            _run_dry_run(input_path, recursive=recursive, quiet=quiet)
+            _run_dry_run(input_path, output_dir=output_dir, quiet=quiet)
         except Exception as e:
             err_console.print(f"[red]error:[/red] {e}")
             sys.exit(1)
@@ -256,6 +283,7 @@ def process(
             backend_type=backend_type,
             model_name=model_name,
             max_dimension=max_dimension,
+            max_tokens=max_tokens,
             ollama_url=settings.ollama_url,
             vllm_base_url=vllm_base_url or settings.vllm_base_url,
         )
@@ -269,6 +297,7 @@ def process(
             output_dir=output_dir,
             reprocess=reprocess,
             analyze_figures=analyze_figures,
+            raw=raw,
         )
 
         backend_instance.unload_model()

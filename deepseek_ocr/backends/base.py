@@ -5,7 +5,6 @@ import random
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Union
 
 from PIL import Image
 
@@ -68,7 +67,7 @@ class Backend(ABC):
     @abstractmethod
     def process_image(
         self,
-        image: Union[Image.Image, Path, str],
+        image: Image.Image | Path | str,
         prompt: str | None = None,
         task: str = "convert",
         return_raw: bool = False,
@@ -85,6 +84,28 @@ class Backend(ABC):
             OCR text result
         """
         ...
+
+    def process_image_with_meta(
+        self,
+        image: Image.Image | Path | str,
+        prompt: str | None = None,
+        task: str = "convert",
+        return_raw: bool = False,
+    ) -> tuple[str, object | None]:
+        """Process an image and return ``(text, finish_reason)``.
+
+        The ``finish_reason`` is the model's completion stop reason (e.g.
+        ``"length"`` / ``"stop"`` / ``None``). The processor feeds it to the
+        contract's :func:`ocr_output_contract.is_truncated` so a length-truncated
+        non-empty page is recorded as a per-page failure (status=partial/failed)
+        rather than a silent ``completed`` (content loss).
+
+        The default delegates to :meth:`process_image` and reports no finish
+        reason, so a backend that does not surface one (or a mock) keeps working
+        with truncation detection simply disabled. Backends that expose a stop
+        reason override this to return it.
+        """
+        return self.process_image(image, prompt=prompt, task=task, return_raw=return_raw), None
 
     def _retry(self, func, *args, **kwargs):
         """Execute func with exponential backoff retry on TransientError.
@@ -133,7 +154,7 @@ class Backend(ABC):
             results.append(result)
         return results
 
-    def describe_figure(self, image: Union[Image.Image, Path, str]) -> str:
+    def describe_figure(self, image: Image.Image | Path | str) -> str:
         """Generate a description of a figure/chart/diagram."""
         return self.process_image(
             image,

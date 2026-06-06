@@ -3,7 +3,6 @@
 import logging
 import re
 from pathlib import Path
-from typing import List
 
 from PIL import Image
 
@@ -14,7 +13,16 @@ SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | {PDF_EXTENSION}
 
 
 def setup_logging(level: str = "WARNING", verbose: bool = False) -> logging.Logger:
-    log_level = logging.DEBUG if verbose else logging.WARNING
+    """Configure logging. ``--verbose`` forces DEBUG; otherwise honor ``level``.
+
+    ``level`` accepts a level name (e.g. ``"INFO"``, ``"WARNING"``) or number, so
+    ``DEEPSEEK_OCR_LOG_LEVEL`` is no longer a dead setting.
+    """
+    if verbose:
+        log_level: int = logging.DEBUG
+    else:
+        resolved = logging.getLevelName(str(level).upper())
+        log_level = resolved if isinstance(resolved, int) else logging.WARNING
 
     logging.basicConfig(
         level=log_level,
@@ -37,11 +45,11 @@ def is_pdf_file(file_path: Path) -> bool:
     return file_path.suffix.lower() == PDF_EXTENSION
 
 
-def collect_files(input_path: Path, recursive: bool = False) -> List[Path]:
+def collect_files(input_path: Path, recursive: bool = False) -> list[Path]:
     if not input_path.exists():
         raise FileNotFoundError(f"Path not found: {input_path}")
 
-    files: List[Path] = []
+    files: list[Path] = []
 
     if input_path.is_file():
         if is_supported_file(input_path):
