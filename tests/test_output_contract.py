@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 
 import fitz
+from ocr_output_contract import UNREADABLE_CHECKSUM
 from ocr_output_contract.conformance import ExpectedDoc, assert_conforms
 from PIL import Image
 
@@ -362,6 +363,9 @@ def test_unreadable_file_recorded_failed_batch_continues(tmp_path):
 
     os.chmod(bad, 0)
     try:
+        # Capture whether chmod(0) actually denied reads in THIS run (it does not
+        # when running as root, e.g. some CI), before permissions are restored.
+        bad_was_unreadable = not os.access(bad, os.R_OK)
         outcome = process(root, FakeBackend(), dpi=120, output_dir=out)
     finally:
         os.chmod(bad, stat.S_IRUSR | stat.S_IWUSR)
@@ -371,9 +375,17 @@ def test_unreadable_file_recorded_failed_batch_continues(tmp_path):
     assert outcome.failed == 1
     assert outcome.exit_code != 0
 
-    # The failed doc has a durable status=failed record (no checksum required).
+    # The failed doc has a durable status=failed record carrying a VALID ``sha256:``
+    # checksum (v0.1.3): the conformance harness rejects a non-``sha256:`` checksum
+    # even on a failure record, so the unreadable-input fallback must be the
+    # ``sha256:`` UNREADABLE_CHECKSUM sentinel, never None/"".
     bad_meta = json.loads((out / "b_bad" / "metadata.json").read_text())
     assert bad_meta["status"] == "failed"
+    assert bad_meta["checksum"].startswith("sha256:")
+    # When chmod(0) actually denied reads (i.e. not running as root, as in normal
+    # local runs) the digest is unobtainable, so the record carries the sentinel.
+    if bad_was_unreadable:
+        assert bad_meta["checksum"] == UNREADABLE_CHECKSUM
 
 
 def test_rerun_under_different_raw_flag_reprocesses(tmp_path):

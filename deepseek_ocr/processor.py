@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 import fitz  # PyMuPDF
 from ocr_output_contract import (
+    UNREADABLE_CHECKSUM,
     DocMetadata,
     RootIndex,
     RunOutcome,
@@ -372,9 +373,14 @@ def _build_doc_metadata(
         elif result.error:
             error = result.error
     # Tolerant checksum: if the source became unreadable mid-run we still persist a
-    # status=failed record (empty checksum) rather than letting the failure-metadata
-    # write itself throw and escape the per-doc error boundary.
-    checksum = _safe_doc_checksum(result.source) or ""
+    # status=failed record rather than letting the failure-metadata write itself throw
+    # and escape the per-doc error boundary. Fall back to the canonical ``sha256:``
+    # UNREADABLE_CHECKSUM sentinel (v0.1.3) instead of "" — the conformance harness
+    # requires a ``sha256:`` checksum even on a failure record. The sentinel can never
+    # equal a real digest, so a later readable run gets a different checksum and
+    # reprocesses. (failure_checksum's generalization to deepseek's two input shapes:
+    # _safe_doc_checksum handles both the single-file and image-directory cases.)
+    checksum = _safe_doc_checksum(result.source) or UNREADABLE_CHECKSUM
     return DocMetadata(
         status=status,
         checksum=checksum,

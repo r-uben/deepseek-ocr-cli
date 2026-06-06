@@ -20,7 +20,7 @@ classifiers = [
     "Topic :: Text Processing :: General",
 ]
 dependencies = [
-    "ocr-output-contract @ git+https://github.com/r-uben/ocr-output-contract@v0.1.2",
+    "ocr-output-contract @ git+https://github.com/r-uben/ocr-output-contract@v0.1.3",
     "pillow>=11.0.0",
     "click>=8.1.7",
     "python-dotenv>=1.0.0",
