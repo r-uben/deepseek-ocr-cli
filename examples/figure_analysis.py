@@ -1,8 +1,14 @@
 #!/usr/bin/env python
-"""Example: Extract and analyze embedded figures from PDFs."""
+"""Example: Extract and analyze embedded figures from PDFs.
+
+With ``analyze_figures=True``, embedded figures are extracted, saved under
+``<output_root>/<stem>/figures/figure_<N>_page<P>.png`` (canon naming), and an
+AI description is appended to the document markdown.
+"""
 
 from pathlib import Path
-from deepseek_ocr import create_backend, OCRProcessor
+
+from deepseek_ocr import create_backend, process
 
 
 def main() -> None:
@@ -12,30 +18,22 @@ def main() -> None:
     backend = create_backend(backend_type="ollama", model_name="deepseek-ocr")
     backend.load_model()
 
-    # Create processor with figure analysis enabled
-    processor = OCRProcessor(
-        backend=backend,
-        output_dir=Path("./output"),
-        analyze_figures=True,
-        workers=2,
-    )
-
+    output_dir = Path("./output")
     pdf_path = Path("test_document.pdf")
     if not pdf_path.exists():
         print(f"Error: {pdf_path} not found")
+        backend.unload_model()
         return
 
     print(f"Processing: {pdf_path}")
-    result = processor.process_file(pdf_path)
+    outcome = process(pdf_path, backend, output_dir=output_dir, analyze_figures=True)
 
-    print(f"Pages: {result.page_count}")
-    print(f"Time: {result.processing_time:.2f}s")
+    for md_path in outcome.outputs:
+        print(f"Output: {md_path}")
+    print(f"completed={outcome.completed} failed={outcome.failed}")
 
-    output_path = processor.save_result(result)
-    print(f"Output: {output_path}")
-
-    # Figures are saved in output/doc_name/figures/
-    figures_dir = Path("./output") / pdf_path.stem / "figures"
+    # Figures are saved in <output_root>/<stem>/figures/.
+    figures_dir = output_dir / pdf_path.stem / "figures"
     if figures_dir.exists():
         figures = list(figures_dir.glob("*"))
         print(f"Figures: {len(figures)} saved to {figures_dir}/")

@@ -24,7 +24,7 @@ from ocr_output_contract.conformance import ExpectedDoc, assert_conforms
 from PIL import Image
 
 from deepseek_ocr.backends.base import Backend
-from deepseek_ocr.processor import process
+from deepseek_ocr.processor import discover_documents, process
 
 
 class FakeBackend(Backend):
@@ -182,3 +182,120 @@ def test_image_dir_document_conforms(tmp_path):
         out,
         [ExpectedDoc(rel_key="scan", pages=2, status="completed")],
     )
+
+
+def test_mixed_dir_with_stray_image_processes_all_pdfs(tmp_path):
+    """HIGH fix: a batch dir holding PDFs + a stray image processes ALL PDFs.
+
+    Previously any direct image misclassified the whole directory as ONE
+    image-document, silently dropping every PDF and subdirectory (the
+    papers-library batch use case). Now a directory that contains a PDF (or a
+    subdir) is a batch tree: every PDF AND the stray image are OCR'd as their own
+    documents, and subdirectories are recursed.
+    """
+    root = tmp_path / "papers"
+    (root / "sub").mkdir(parents=True)
+    _make_pdf(root / "paper1.pdf", pages=1)
+    _make_pdf(root / "sub" / "paper2.pdf", pages=1)
+    Image.new("RGB", (60, 60), "white").save(root / "cover.png")
+    out = tmp_path / "out"
+
+    outcome = process(root, FakeBackend(), dpi=120, output_dir=out)
+    assert outcome.exit_code == 0
+    # 2 PDFs + 1 stray image = 3 documents, none dropped.
+    assert outcome.completed == 3
+
+    assert_conforms(
+        out,
+        [
+            ExpectedDoc(rel_key="paper1.pdf", pages=1, status="completed"),
+            ExpectedDoc(rel_key="sub/paper2.pdf", pages=1, status="completed"),
+            ExpectedDoc(rel_key="cover.png", pages=1, status="completed"),
+        ],
+    )
+
+
+def test_rerun_does_not_reingest_default_output_root(tmp_path):
+    """HIGH fix: the default <input>/ocr/ output is excluded from re-run discovery.
+
+    With the default (nested) output root, a second run must not re-discover the
+    first run's own .md/figure outputs as fresh inputs. Discovery via
+    iter_input_files prunes the resolved output-root subtree.
+    """
+    root = tmp_path / "papers"
+    root.mkdir()
+    _make_pdf(root / "doc.pdf", pages=1)
+
+    # First run with the DEFAULT output root (<input>/ocr/, inside the tree).
+    outcome1 = process(root, FakeBackend(), dpi=120)
+    assert outcome1.completed == 1
+    assert (root / "ocr").is_dir()  # default root sits inside the scanned tree
+
+    # Second run: the only new document is still the one PDF; the ocr/ outputs
+    # (markdown + metadata) must NOT be re-discovered as inputs.
+    docs = discover_documents(root)
+    assert docs == [root / "doc.pdf"]
+
+
+def test_truncated_page_recorded_partial_not_completed(tmp_path):
+    """MEDIUM fix: a length-truncated non-empty page is partial/failed, not completed.
+
+    The backend reports a length finish_reason; the page text is non-empty but
+    incomplete, so recording it as completed would be silent content loss.
+    """
+    pdf = tmp_path / "dense.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    class TruncatingBackend(FakeBackend):
+        def process_image_with_meta(self, image, prompt=None, task="convert", return_raw=False):
+            # Non-empty text, but the model stopped on the token limit.
+            return "partial dense content cut off", "length"
+
+    outcome = process(pdf, TruncatingBackend(), dpi=120, output_dir=out)
+    assert outcome.exit_code != 0
+
+    doc_meta = json.loads((out / "dense" / "metadata.json").read_text())
+    assert doc_meta["status"] == "failed"  # single page truncated -> no good pages
+    assert "truncat" in doc_meta["error"].lower()
+
+
+def test_quiet_skip_emits_md_path_on_resume(tmp_path):
+    """MEDIUM fix: a cached/resumed doc still contributes its .md path to outputs.
+
+    On the first run the doc is processed and its path emitted; on the second run
+    it is skipped (already completed) but must STILL appear in outcome.outputs so
+    `deepseek-ocr dir -q` does not silently drop cached docs.
+    """
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    outcome1 = process(pdf, FakeBackend(), dpi=120, output_dir=out)
+    md = out / "doc" / "doc.md"
+    assert outcome1.outputs == [str(md)]
+
+    # Second run: skip branch, but the .md path is still emitted.
+    outcome2 = process(pdf, FakeBackend(), dpi=120, output_dir=out)
+    assert outcome2.completed == 1
+    assert outcome2.outputs == [str(md)]
+
+
+def test_rerun_under_different_task_reprocesses(tmp_path):
+    """The run fingerprint invalidates the cache when --task changes.
+
+    A re-run under a different task must NOT silently reuse the prior output: the
+    fingerprint (model/backend/task/prompt) differs, so is_completed returns False.
+    """
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    be1 = FakeBackend(text="convert output")
+    process(pdf, be1, dpi=120, task="convert", output_dir=out)
+    assert be1.calls == 1
+
+    # Same input, different task -> fingerprint differs -> reprocessed (not skipped).
+    be2 = FakeBackend(text="ocr output")
+    process(pdf, be2, dpi=120, task="ocr", output_dir=out)
+    assert be2.calls == 1

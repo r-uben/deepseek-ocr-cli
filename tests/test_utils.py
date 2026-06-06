@@ -1,14 +1,13 @@
 """Tests for utility functions."""
 
-import pytest
 from pathlib import Path
+
 from deepseek_ocr.utils import (
-    is_supported_file,
+    IMAGE_EXTENSIONS,
     is_image_file,
     is_pdf_file,
+    is_supported_file,
     sanitize_filename,
-    IMAGE_EXTENSIONS,
-    PDF_EXTENSION,
 )
 
 

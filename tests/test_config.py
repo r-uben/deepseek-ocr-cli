@@ -1,7 +1,5 @@
 """Tests for configuration management."""
 
-from pathlib import Path
-
 from deepseek_ocr.config import Settings
 
 
@@ -16,9 +14,7 @@ class TestSettings:
         assert settings.ollama_url == "http://localhost:11434"
         assert settings.vllm_base_url == "http://localhost:8000/v1"
         assert settings.max_dimension == 1920
-        assert settings.output_dir == Path("output")
-        assert settings.extract_images is False
-        assert settings.include_metadata is True
+        assert settings.max_tokens == 8192
         assert settings.max_retries == 3
         assert settings.retry_delay == 1.0
 
