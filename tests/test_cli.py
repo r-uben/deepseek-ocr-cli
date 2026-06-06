@@ -89,6 +89,27 @@ class TestDryRun:
             assert "scan" in result.output
             assert "IMG DIR" in result.output
 
+    def test_dry_run_image_dir_page_count_ignores_stray_files(self) -> None:
+        """LOW fix: image-dir dry-run counts only image files, matching the real run.
+
+        A directory of 2 images plus a stray non-image file is one image-dir
+        document of 2 pages (the real run filters by image suffix). The dry-run
+        preview must report 2 pages, not 3, so it never diverges from what is OCR'd.
+        """
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "scan"
+            root.mkdir()
+            for n in (1, 2):
+                Image.new("RGB", (50, 50)).save(root / f"page_{n:04d}.png")
+            (root / "notes.txt").write_text("not an image")
+
+            result = runner.invoke(cli, ["process", str(root), "--dry-run"])
+            assert result.exit_code == 0
+            assert "IMG DIR" in result.output
+            # The summary line reports total pages = image count (2), not 3.
+            assert "2 pages" in result.output
+
     def test_dry_run_quiet(self) -> None:
         """Dry run with --quiet outputs only file paths."""
         runner = CliRunner()
@@ -117,6 +138,63 @@ class TestQuietFlag:
             result = runner.invoke(cli, ["process", str(img_path), "--dry-run", "--quiet"])
             assert result.exit_code == 0
             assert "deepseek-ocr v" not in result.output
+
+
+class TestModelPrecedence:
+    """LOW fix: DEEPSEEK_OCR_MODEL_NAME / settings.model_name wins when --model omitted."""
+
+    def _run_capturing_model(self, monkeypatch, argv: list[str]) -> str:
+        """Invoke `process` with backend creation + OCR stubbed; return the model_name."""
+        import deepseek_ocr.cli as cli_mod
+
+        captured: dict[str, str] = {}
+
+        def fake_create_backend(*, backend_type, model_name, **kwargs):
+            captured["model_name"] = model_name
+            return _StubBackend()  # OCR is stubbed; only unload_model() is called
+
+        monkeypatch.setattr(cli_mod, "create_backend", fake_create_backend)
+        monkeypatch.setattr(cli_mod, "run_process", lambda *a, **k: _StubOutcome())
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf = Path(tmpdir) / "doc.pdf"
+            _make_pdf(pdf)
+            result = runner.invoke(cli, ["process", str(pdf), *argv])
+        assert result.exit_code == 0, result.output
+        return captured["model_name"]
+
+    def test_env_model_used_when_flag_omitted(self, monkeypatch) -> None:
+        """With no --model, settings.model_name (DEEPSEEK_OCR_MODEL_NAME) wins."""
+        from deepseek_ocr.config import settings
+
+        monkeypatch.setattr(settings, "model_name", "env-model")
+        assert self._run_capturing_model(monkeypatch, []) == "env-model"
+
+    def test_cli_model_overrides_env(self, monkeypatch) -> None:
+        """An explicit --model wins over settings.model_name."""
+        from deepseek_ocr.config import settings
+
+        monkeypatch.setattr(settings, "model_name", "env-model")
+        assert self._run_capturing_model(monkeypatch, ["--model", "cli-model"]) == "cli-model"
+
+
+class _StubOutcome:
+    """Minimal RunOutcome stand-in so the CLI can finish without real OCR."""
+
+    completed = 0
+    failed = 0
+    partial = 0
+    has_failures = False
+    exit_code = 0
+    outputs: list[str] = []
+    failures: list[str] = []
+
+
+class _StubBackend:
+    """Backend stand-in: the CLI only calls unload_model() after a stubbed run."""
+
+    def unload_model(self) -> None:
+        pass
 
 
 class TestAutoInsertProcess:

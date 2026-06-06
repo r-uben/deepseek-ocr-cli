@@ -299,3 +299,120 @@ def test_rerun_under_different_task_reprocesses(tmp_path):
     be2 = FakeBackend(text="ocr output")
     process(pdf, be2, dpi=120, task="ocr", output_dir=out)
     assert be2.calls == 1
+
+
+def test_image_dir_classification_stable_across_reruns_default_root(tmp_path):
+    """MEDIUM fix: an image-dir document classifies identically on run 1 and re-run.
+
+    With the DEFAULT output root (``<input>/ocr/``, nested INSIDE the scanned dir),
+    the first run of an image directory creates that ``ocr/`` subtree. Without
+    output-root-aware classification, the re-run would see the new subdir, decide
+    the folder is no longer a pure image dir, and silently reclassify it as a BATCH
+    tree (one aggregated ``scan/scan.md`` on run 1 -> per-image ``page_0001_png/``
+    trees on run 2: non-idempotent, orphaned output, spurious index entries, broken
+    resume). Classification must be STABLE: a first run and a re-run see the same
+    single image-dir document.
+    """
+    src = tmp_path / "scan"
+    src.mkdir()
+    for n in (1, 2):
+        Image.new("RGB", (60, 60), "white").save(src / f"page_{n:04d}.png")
+
+    # Run 1 (default output root): classified as ONE image-dir document.
+    docs_run1 = discover_documents(src)
+    assert docs_run1 == [src]
+
+    # Actually run it so the default ocr/ subtree is created inside the scanned dir.
+    outcome1 = process(src, FakeBackend(), dpi=120)
+    assert outcome1.completed == 1
+    assert (src / "ocr").is_dir()  # default root nests inside the scanned tree
+
+    # Re-run classification: the engine's own ocr/ subtree must NOT flip the
+    # decision. Still exactly ONE image-dir document, identical to run 1.
+    docs_run2 = discover_documents(src)
+    assert docs_run2 == docs_run1 == [src]
+
+    # And a real re-run stays idempotent: still one completed document, and NO
+    # per-image batch trees were emitted under the output root.
+    outcome2 = process(src, FakeBackend(), dpi=120)
+    assert outcome2.completed == 1
+    out_root = src / "ocr"
+    assert (out_root / "scan" / "scan.md").exists()
+    assert not (out_root / "page_0001_png").exists()
+    assert not (out_root / "page_0002_png").exists()
+
+
+def test_unreadable_file_recorded_failed_batch_continues(tmp_path):
+    """SYS-02 fix: an unreadable input fails ITSELF; the batch keeps going.
+
+    A file that becomes unreadable between discovery and processing must be
+    recorded status=failed (via the safe checksum + per-doc catch-all), not raise
+    an OSError that aborts the whole batch and drops the good files.
+    """
+    import os
+    import stat
+
+    root = tmp_path / "papers"
+    root.mkdir()
+    _make_pdf(root / "a_good.pdf", pages=1)
+    bad = root / "b_bad.pdf"
+    _make_pdf(bad, pages=1)
+    _make_pdf(root / "c_good.pdf", pages=1)
+    out = tmp_path / "out"
+
+    os.chmod(bad, 0)
+    try:
+        outcome = process(root, FakeBackend(), dpi=120, output_dir=out)
+    finally:
+        os.chmod(bad, stat.S_IRUSR | stat.S_IWUSR)
+
+    # The whole batch did NOT abort: two good files completed, the bad one failed.
+    assert outcome.completed == 2
+    assert outcome.failed == 1
+    assert outcome.exit_code != 0
+
+    # The failed doc has a durable status=failed record (no checksum required).
+    bad_meta = json.loads((out / "b_bad" / "metadata.json").read_text())
+    assert bad_meta["status"] == "failed"
+
+
+def test_rerun_under_different_raw_flag_reprocesses(tmp_path):
+    """The run fingerprint extra invalidates the cache when --raw changes.
+
+    --raw genuinely changes page text (it skips clean_ocr_output), so a re-run with
+    a different --raw must reprocess, not silently reuse the prior cleaned output.
+    """
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    be1 = FakeBackend(text="output")
+    process(pdf, be1, dpi=120, raw=False, output_dir=out)
+    assert be1.calls == 1
+
+    # Same input/task/prompt, different --raw -> fingerprint extra differs -> reprocess.
+    be2 = FakeBackend(text="output")
+    process(pdf, be2, dpi=120, raw=True, output_dir=out)
+    assert be2.calls == 1
+
+
+def test_rerun_same_prompt_different_task_not_reprocessed(tmp_path):
+    """LOW fix: --task does NOT over-invalidate the cache when --prompt is set.
+
+    The backends ignore --task when a custom --prompt is given (they only call
+    get_prompt(task) when prompt is None), so two runs with the SAME prompt but a
+    DIFFERENT task produce identical output and must be cache-skipped, not
+    needlessly reprocessed. task is dropped from the fingerprint when prompt is set.
+    """
+    pdf = tmp_path / "doc.pdf"
+    _make_pdf(pdf, pages=1)
+    out = tmp_path / "out"
+
+    be1 = FakeBackend(text="output")
+    process(pdf, be1, dpi=120, prompt="my custom prompt", task="convert", output_dir=out)
+    assert be1.calls == 1
+
+    # Same prompt, different task -> same fingerprint -> skipped (no reprocess).
+    be2 = FakeBackend(text="output")
+    process(pdf, be2, dpi=120, prompt="my custom prompt", task="ocr", output_dir=out)
+    assert be2.calls == 0

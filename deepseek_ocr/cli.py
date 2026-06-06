@@ -17,7 +17,7 @@ from rich.table import Table
 from deepseek_ocr import __version__
 from deepseek_ocr.backends import create_backend
 from deepseek_ocr.config import settings
-from deepseek_ocr.processor import discover_documents
+from deepseek_ocr.processor import _IMAGE_SUFFIXES, discover_documents
 from deepseek_ocr.processor import process as run_process
 from deepseek_ocr.utils import is_pdf_file, setup_logging
 
@@ -78,7 +78,10 @@ def _run_dry_run(input_path: Path, output_dir: Path | None, quiet: bool) -> None
     for idx, f in enumerate(files, 1):
         if f.is_dir():
             # An image directory is OCR'd as ONE document, one page per image.
-            images = [p for p in f.iterdir() if p.is_file()]
+            # Count ONLY the image files the real run (_gather_images) processes, so
+            # the preview never over-reports pages for a dir holding stray non-image
+            # files (the dry-run/real-run divergence the review flagged).
+            images = [p for p in f.iterdir() if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES]
             size = sum(p.stat().st_size for p in images)
             pages = len(images)
             file_type = "IMG DIR"
@@ -144,8 +147,8 @@ def cli(ctx: click.Context) -> None:
     "--model",
     "model_name",
     type=str,
-    default="deepseek-ocr",
-    help="Ollama model name (default: deepseek-ocr).",
+    default=None,
+    help="Model name. CLI wins; else DEEPSEEK_OCR_MODEL_NAME / settings (default: deepseek-ocr).",
 )
 @click.option(
     "--prompt",
@@ -230,7 +233,7 @@ def process(
     input_path: Path,
     output_dir: Path | None,
     recursive: bool,
-    model_name: str,
+    model_name: str | None,
     prompt: str | None,
     task: str,
     dpi: int,
@@ -274,14 +277,22 @@ def process(
     # Resolve backend from CLI flag or config.
     backend_type = backend or settings.backend
 
-    # For vLLM, default model is deepseek-vl2 unless explicitly specified.
-    if backend_type == "vllm" and model_name == "deepseek-ocr":
-        model_name = "deepseek-vl2"
+    # Resolve the model: an explicit --model on the command line wins; otherwise
+    # fall back to settings.model_name (which honors DEEPSEEK_OCR_MODEL_NAME / .env),
+    # NOT a click default that would silently shadow the env var. We treat the model
+    # as "unset" when --model was not passed AND the env did not override the default.
+    model_from_cli = model_name is not None
+    resolved_model: str = model_name if model_name is not None else settings.model_name
+    model_is_default = not model_from_cli and resolved_model == "deepseek-ocr"
+
+    # For vLLM, default model is deepseek-vl2 unless a model was explicitly chosen.
+    if backend_type == "vllm" and model_is_default:
+        resolved_model = "deepseek-vl2"
 
     try:
         backend_instance = create_backend(
             backend_type=backend_type,
-            model_name=model_name,
+            model_name=resolved_model,
             max_dimension=max_dimension,
             max_tokens=max_tokens,
             ollama_url=settings.ollama_url,

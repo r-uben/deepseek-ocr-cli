@@ -36,11 +36,13 @@ from ocr_output_contract import (
     figure_markdown_link,
     figures_dir_for,
     is_truncated,
+    is_within_output_root,
     iter_input_files,
     markdown_path_for,
     relative_key,
     resolve_output_root,
     run_fingerprint,
+    safe_checksum,
     sha256_checksum,
     utc_timestamp,
     write_doc_metadata,
@@ -333,6 +335,27 @@ def _doc_checksum(source: Path) -> str:
     return f"sha256:{h.hexdigest()}"
 
 
+def _safe_doc_checksum(source: Path) -> str | None:
+    """Like :func:`_doc_checksum`, but ``None`` instead of raising on an OSError.
+
+    Mirrors the contract's :func:`safe_checksum` for deepseek's two input shapes:
+    a single file (delegating to ``safe_checksum``) and an image directory (which
+    may still raise if an image is deleted/unreadable between discovery and
+    processing). A ``None`` result means "input unreadable now" — the idempotency
+    pre-check must NOT skip (it processes, and the per-doc catch-all in
+    :func:`_ocr_one_document` records that one doc ``status=failed`` and the batch
+    CONTINUES, rather than an ``OSError`` aborting the whole run — the SYS-02
+    "one bad file aborts the batch" failure mode).
+    """
+    if source.is_file():
+        # safe_checksum already returns None on OSError for the single-file case.
+        return safe_checksum(source)
+    try:
+        return _doc_checksum(source)
+    except OSError:
+        return None
+
+
 def _build_doc_metadata(
     result: DocResult,
     markdown_path: Path,
@@ -348,9 +371,13 @@ def _build_doc_metadata(
             error = "; ".join(f"page {n}: {msg}" for n, msg in sorted(result.page_errors.items()))
         elif result.error:
             error = result.error
+    # Tolerant checksum: if the source became unreadable mid-run we still persist a
+    # status=failed record (empty checksum) rather than letting the failure-metadata
+    # write itself throw and escape the per-doc error boundary.
+    checksum = _safe_doc_checksum(result.source) or ""
     return DocMetadata(
         status=status,
-        checksum=_doc_checksum(result.source),
+        checksum=checksum,
         model=_backend_model(backend),
         backend=_backend_name(backend),
         processing_time=result.processing_time,
@@ -434,18 +461,41 @@ def process(
 
     output_root.mkdir(parents=True, exist_ok=True)
     index = RootIndex(output_root)
+    # Run fingerprint keys the idempotency cache on everything that changes a
+    # document's OUTPUT for a given input. The dedicated task/prompt params handle
+    # the prompt selector; ``extra`` carries the remaining RESOLVED output-affecting
+    # flags (raw, dpi, max_tokens, analyze_figures) so a re-run with any of them
+    # changed reprocesses instead of silently reusing a stale cached result.
+    #
+    # When a custom --prompt is set the backends IGNORE --task (they only call
+    # get_prompt(task) when prompt is None), so task is dropped from the fingerprint
+    # to avoid needlessly reprocessing two same-prompt runs that differ only in task.
     fingerprint = run_fingerprint(
         model=_backend_model(backend),
         backend=_backend_name(backend),
-        task=task,
+        task=None if prompt is not None else task,
         prompt=prompt,
+        extra={
+            "raw": raw,
+            "dpi": dpi,
+            "max_tokens": getattr(backend, "max_tokens", None),
+            "analyze_figures": analyze_figures,
+        },
     )
 
     outcome = RunOutcome()
     for doc in documents:
         rel_key = relative_key(doc, scan_root)
-        if not reprocess and index.is_completed(
-            rel_key, _doc_checksum(doc), fingerprint=fingerprint
+        # Idempotency pre-check uses the SAFE checksum: an input that became
+        # unreadable between discovery and processing yields None, which can never
+        # match a recorded checksum, so the doc is NOT skipped — it falls through to
+        # _ocr_one_document, whose catch-all records it status=failed and the batch
+        # CONTINUES (no whole-run abort: the SYS-02 class the contract guards).
+        pre_checksum = _safe_doc_checksum(doc)
+        if (
+            not reprocess
+            and pre_checksum is not None
+            and index.is_completed(rel_key, pre_checksum, fingerprint=fingerprint)
         ):
             logger.info("skip %s (already completed; use --reprocess)", rel_key)
             # Quiet mode emits one .md path per processed doc; a cached/resumed doc
@@ -493,7 +543,7 @@ def discover_documents(source: Path, output_dir: Path | None = None) -> list[Pat
     return documents
 
 
-def _is_image_dir_document(source: Path) -> bool:
+def _is_image_dir_document(source: Path, output_root: Path) -> bool:
     """True when ``source`` is unambiguously ONE document made of page images.
 
     socr renders a PDF to ``page_0001.png ...`` and passes the directory, expecting
@@ -502,11 +552,24 @@ def _is_image_dir_document(source: Path) -> bool:
     or a subdirectory is present, ``source`` is a batch tree (the papers-library use
     case) and must be walked recursively — treating it as one image-document would
     silently drop every PDF and subdir (the HIGH bug this guard fixes).
+
+    Classification is OUTPUT-ROOT-AWARE so it is STABLE across runs. With the
+    default output root ``<input>/ocr/`` nested inside the scanned directory, the
+    first run creates that ``ocr/`` subtree; without this exclusion, a re-run would
+    see the new subdir, return False, and silently reclassify the SAME folder as a
+    batch tree (the run-1 aggregated ``scan/scan.md`` orphaned, per-image
+    ``page_0001_png/`` trees emitted on run 2, broken resume). The resolved output
+    root — and its own ``.md``/figure/metadata outputs — are excluded from the
+    scan so a first run and a re-run classify the same input identically.
     """
     if not source.is_dir():
         return False
     has_image = False
     for p in source.iterdir():
+        # Skip the engine's own output subtree (default root nests in the input):
+        # it must not shift classification between runs.
+        if is_within_output_root(p, output_root):
+            continue
         if p.is_dir():
             return False
         suffix = p.suffix.lower()
@@ -531,7 +594,7 @@ def _discover_documents(source: Path, output_root: Path) -> tuple[list[Path], Pa
         return [source], source.parent
     if not source.is_dir():
         return [], source
-    if _is_image_dir_document(source):
+    if _is_image_dir_document(source, output_root):
         # The image-dir document keys on its own folder name (no file stem).
         return [source], source.parent
     suffixes = _DOC_SUFFIXES | _IMAGE_SUFFIXES
